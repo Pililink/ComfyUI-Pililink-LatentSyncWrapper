@@ -53,7 +53,7 @@ def resolve_active_latentsync_root(env_root, new_root, legacy_root, alt_new_root
     if has_required_latentsync_files(alt_new_root):
         return alt_new_root
     if has_required_latentsync_files(legacy_root):
-        print("[Geeky LatentSync] 发现旧目录模型，保持兼容使用 legacy 路径。")
+        print("[Pililink LatentSync] 发现旧目录模型，保持兼容使用 legacy 路径。")
         return legacy_root
     return new_root
 

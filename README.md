@@ -6,9 +6,7 @@
 - 长视频更稳定（分段推理，降低内存峰值）
 - 支持工作流中断
 
-本仓库的实现与改造基于以下项目进行调整：
-
-- https://github.com/GeekyGhost/ComfyUI-Geeky-LatentSyncWrapper
+本仓库的实现与改造基于上游 LatentSync ComfyUI 封装项目进行调整。
 
 ---
 
@@ -39,7 +37,7 @@
 ```bash
 cd ComfyUI/custom_nodes
 git clone <your-repo-url>
-cd ComfyUI-Geeky-LatentSyncWrapper
+cd ComfyUI-Pililink-LatentSyncWrapper
 pip install -r requirements.txt
 ```
 

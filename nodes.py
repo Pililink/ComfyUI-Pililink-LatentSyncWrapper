@@ -19,7 +19,7 @@ import torchaudio
 from omegaconf import OmegaConf
 
 # Global model cache to avoid reloading models - Using unique name to avoid conflicts
-_GEEKY_MODEL_CACHE = {}
+_PILILINK_MODEL_CACHE = {}
 REQUIRED_PACKAGES = [
     "omegaconf",
     "transformers",
@@ -68,39 +68,74 @@ def check_for_conflicts():
         original_path = os.path.join(custom_nodes_dir, "ComfyUI-LatentSyncWrapper")
         
         if os.path.exists(original_path):
-            print("[Geeky LatentSync] Detected ComfyUI-LatentSyncWrapper - using isolated paths to avoid conflicts")
+            print("[Pililink LatentSync] Detected ComfyUI-LatentSyncWrapper - using isolated paths to avoid conflicts")
             return True
     except:
         pass
     return False
 
 def get_unique_temp_path(suffix=""):
-    """Generate unique temp paths for geeky wrapper"""
-    return os.path.join(tempfile.gettempdir(), f"geeky_latentsync_{uuid.uuid4().hex[:8]}{suffix}")
+    return os.path.join(get_comfy_temp_root(), f"pilkilink_latentsync_{uuid.uuid4().hex[:8]}{suffix}")
+
+
+def _normalize_str_path(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode()
+        except Exception:
+            return None
+    if isinstance(value, os.PathLike):
+        path_value = os.fspath(value)
+        if isinstance(path_value, str):
+            return path_value
+        if isinstance(path_value, bytes):
+            try:
+                return path_value.decode()
+            except Exception:
+                return None
+    return None
+
+
+def get_comfy_temp_root():
+    try:
+        get_temp_directory = getattr(folder_paths, "get_temp_directory", None)
+        if callable(get_temp_directory):
+            comfy_temp = _normalize_str_path(get_temp_directory())
+            if comfy_temp:
+                return comfy_temp
+    except Exception:
+        pass
+
+    comfy_temp = _normalize_str_path(getattr(folder_paths, "temp_directory", None))
+    if comfy_temp:
+        return comfy_temp
+
+    output_dir = _normalize_str_path(getattr(folder_paths, "output_directory", None))
+    if output_dir:
+        return os.path.join(output_dir, "temp")
+
+    return tempfile.gettempdir()
 
 # Create a module-level function to set up node-local temp directory
 def init_temp_directories():
-    """Initialize per-node temporary directory settings.
+    comfy_temp_root = get_comfy_temp_root()
+    os.makedirs(comfy_temp_root, exist_ok=True)
 
-    This stays inside the custom node folder and never modifies ComfyUI global temp.
-    """
-    node_dir = os.path.dirname(os.path.abspath(__file__))
-    node_tmp_root = os.path.join(node_dir, "tmp")
-    os.makedirs(node_tmp_root, exist_ok=True)
-
-    session_dir = os.path.join(node_tmp_root, f"geeky_latentsync_{uuid.uuid4().hex[:8]}")
+    session_dir = os.path.join(comfy_temp_root, f"pilkilink_latentsync_{uuid.uuid4().hex[:8]}")
     os.makedirs(session_dir, exist_ok=True)
 
-    print(f"Set up node-local temp directory: {session_dir}")
+    print(f"Set up ComfyUI temp directory: {session_dir}")
     return session_dir
 
 # Function to clean up everything when the module exits
 def module_cleanup():
     """Clean up all resources when the module is unloaded"""
-    global MODULE_TEMP_DIR, _GEEKY_MODEL_CACHE
+    global MODULE_TEMP_DIR, _PILILINK_MODEL_CACHE
     
     # Clear model cache references to free memory
-    _GEEKY_MODEL_CACHE.clear()
+    _PILILINK_MODEL_CACHE.clear()
     
     # Clean up temp directory (node-local session directory)
     if MODULE_TEMP_DIR and os.path.exists(MODULE_TEMP_DIR):
@@ -145,28 +180,27 @@ def get_latentsync_path(*parts, mkdir_parent=False):
 
 
 def get_cached_model(model_path, model_type, device):
-    """Load model from geeky-specific cache or disk and cache it"""
-    global _GEEKY_MODEL_CACHE
-    cache_key = f"geeky_{model_type}_{model_path}"
+    global _PILILINK_MODEL_CACHE
+    cache_key = f"pililink_{model_type}_{model_path}"
     
-    if cache_key in _GEEKY_MODEL_CACHE:
+    if cache_key in _PILILINK_MODEL_CACHE:
         # Check if the cached model is on the right device
-        cached_model = _GEEKY_MODEL_CACHE[cache_key]
+        cached_model = _PILILINK_MODEL_CACHE[cache_key]
         model_device = next(cached_model.parameters()).device
         if str(model_device) == str(device):
-            print(f"Using cached {model_type} model from Geeky cache")
+            print(f"Using cached {model_type} model from Pililink cache")
             return cached_model
         else:
             print(f"Moving cached {model_type} model to {device}")
             cached_model = cached_model.to(device)
             return cached_model
     
-    print(f"Loading {model_type} model from disk into Geeky cache")
+    print(f"Loading {model_type} model from disk into Pililink cache")
     # Load the model
     model = torch.load(model_path, map_location=device)
     
     # Cache the model
-    _GEEKY_MODEL_CACHE[cache_key] = model
+    _PILILINK_MODEL_CACHE[cache_key] = model
     return model
 
 def import_inference_script(script_path):
@@ -174,14 +208,14 @@ def import_inference_script(script_path):
     if not os.path.exists(script_path):
         raise ImportError(f"Script not found: {script_path}")
 
-    module_name = "geeky_latentsync_inference"  # Unique module name
+    module_name = "pililink_latentsync_inference"  # Unique module name
 
     # Always reload to avoid stale module cache after code updates.
     if module_name in sys.modules:
         del sys.modules[module_name]
-        print("Reloading Geeky inference module")
+        print("Reloading Pililink inference module")
     
-    print(f"Importing Geeky inference script from {script_path}")
+    print(f"Importing Pililink inference script from {script_path}")
     spec = importlib.util.spec_from_file_location(module_name, script_path)
     if spec is None:
         raise ImportError(f"Failed to create module spec for {script_path}")
@@ -235,9 +269,9 @@ def check_and_install_dependencies():
     # Create the cache directory if it doesn't exist
     os.makedirs(cache_dir, exist_ok=True)
     
-    cache_marker = os.path.join(cache_dir, ".geeky_deps_installed")
+    cache_marker = os.path.join(cache_dir, ".pililink_deps_installed")
     if os.path.exists(cache_marker):
-        print("Geeky dependencies already verified, skipping check.")
+        print("Pililink dependencies already verified, skipping check.")
         return
         
     def is_package_installed(package_name):
@@ -273,7 +307,7 @@ def check_and_install_dependencies():
     # Create marker file
     try:
         with open(cache_marker, 'w') as f:
-            f.write(f"Geeky dependencies checked on {time.ctime()}")
+            f.write(f"Pililink dependencies checked on {time.ctime()}")
     except Exception as e:
         print(f"Warning: Could not create cache marker file: {str(e)}")
 
@@ -336,9 +370,9 @@ def pre_download_models():
     os.makedirs(cache_dir, exist_ok=True)
     
     # Check if we've already run this function successfully by creating a marker file
-    cache_marker = os.path.join(cache_dir, ".geeky_cache_complete")
+    cache_marker = os.path.join(cache_dir, ".pililink_cache_complete")
     if os.path.exists(cache_marker):
-        print("Pre-downloaded Geeky models already exist, skipping download.")
+        print("Pre-downloaded Pililink models already exist, skipping download.")
         return
     
     for model_name, url in models.items():
@@ -347,11 +381,11 @@ def pre_download_models():
             print(f"Downloading {model_name}...")
             download_model(url, save_path)
         else:
-            print(f"{model_name} already exists in Geeky cache.")
+            print(f"{model_name} already exists in Pililink cache.")
     
     # Create marker file to indicate successful completion
     with open(cache_marker, 'w') as f:
-        f.write(f"Geeky cache completed on {time.ctime()}")
+        f.write(f"Pililink cache completed on {time.ctime()}")
 
 def setup_models():
     """Setup and pre-download all required models."""
@@ -377,10 +411,10 @@ def setup_models():
 
     # Only download if the files don't already exist
     if os.path.exists(unet_path) and os.path.exists(whisper_path):
-        print("Geeky model checkpoints already exist, skipping download.")
+        print("Pililink model checkpoints already exist, skipping download.")
         return
         
-    print("Downloading required Geeky model checkpoints... This may take a while.")
+    print("Downloading required Pililink model checkpoints... This may take a while.")
     try:
         throw_if_processing_interrupted()
         if snapshot_download is None:
@@ -391,17 +425,17 @@ def setup_models():
                          local_dir_use_symlinks=False,
                          cache_dir=temp_downloads)
         throw_if_processing_interrupted()
-        print("Geeky model checkpoints downloaded successfully!")
+        print("Pililink model checkpoints downloaded successfully!")
     except Exception as e:
-        print(f"Error downloading Geeky models: {str(e)}")
-        print("\nPlease download models manually for Geeky LatentSync:")
+        print(f"Error downloading Pililink models: {str(e)}")
+        print("\nPlease download models manually for Pililink LatentSync:")
         print("1. Visit: https://huggingface.co/chunyu-li/LatentSync")
         print("2. Download: latentsync_unet.pt and whisper/tiny.pt")
         print(f"3. Place them in: {ckpt_dir}")
         print(f"   with whisper/tiny.pt in: {whisper_dir}")
-        raise RuntimeError("Geeky model download failed. See instructions above.")
+        raise RuntimeError("Pililink model download failed. See instructions above.")
 
-class GeekyLatentSyncNode:
+class PililinkLatentSyncNode:
     def __init__(self):
         # Make sure our temp directory is the current one
         global MODULE_TEMP_DIR
@@ -460,9 +494,9 @@ class GeekyLatentSyncNode:
         # Define timing checkpoint function
         def log_timing(step):
             elapsed = time.time() - start_time
-            print(f"[Geeky {elapsed:.2f}s] {step}")
+            print(f"[Pililink {elapsed:.2f}s] {step}")
         
-        log_timing("Starting Geeky inference")
+        log_timing("Starting Pililink inference")
         
         # Get GPU capabilities and memory
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -481,18 +515,18 @@ class GeekyLatentSyncNode:
                 torch.backends.cuda.matmul.allow_tf32 = True if hasattr(torch.backends.cuda, "matmul") else False
                 torch.backends.cudnn.allow_tf32 = True
                 torch.cuda.set_per_process_memory_fraction(0.95)
-                print(f"Using Geeky high VRAM settings with {batch_size} batch size")
+                print(f"Using Pililink high VRAM settings with {batch_size} batch size")
             elif vram_usage == "medium":
                 batch_size = min(16, 80 // inference_steps)
                 use_mixed_precision = True
                 torch.backends.cudnn.benchmark = True
                 torch.cuda.set_per_process_memory_fraction(0.85)
-                print(f"Using Geeky medium VRAM settings with {batch_size} batch size")
+                print(f"Using Pililink medium VRAM settings with {batch_size} batch size")
             else:  # low
                 batch_size = min(8, 40 // inference_steps)
                 use_mixed_precision = False
                 torch.cuda.set_per_process_memory_fraction(0.75)
-                print(f"Using Geeky low VRAM settings with {batch_size} batch size")
+                print(f"Using Pililink low VRAM settings with {batch_size} batch size")
                 
             # Clear GPU cache before processing
             torch.cuda.empty_cache()
@@ -503,7 +537,7 @@ class GeekyLatentSyncNode:
         
         # Create a run-specific subdirectory in our temp directory
         run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
-        temp_dir = os.path.join(MODULE_TEMP_DIR, f"geeky_run_{run_id}")
+        temp_dir = os.path.join(MODULE_TEMP_DIR, f"pililink_run_{run_id}")
         os.makedirs(temp_dir, exist_ok=True)
         
         temp_video_path = None
@@ -513,9 +547,9 @@ class GeekyLatentSyncNode:
         try:
             global av_mod
             # Create temporary file paths in our system temp directory
-            temp_video_path = os.path.join(temp_dir, f"geeky_temp_{run_id}.mp4")
-            output_video_path = os.path.join(temp_dir, f"geeky_latentsync_{run_id}_out.mp4")
-            audio_path = os.path.join(temp_dir, f"geeky_latentsync_{run_id}_audio.wav")
+            temp_video_path = os.path.join(temp_dir, f"pililink_temp_{run_id}.mp4")
+            output_video_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_out.mp4")
+            audio_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_audio.wav")
             
             # Get the extension directory
             cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -557,7 +591,7 @@ class GeekyLatentSyncNode:
                 single_frame = frames[0]
                 duplicated_frames = single_frame.unsqueeze(0).repeat(required_frames, 1, 1, 1)
                 frames = duplicated_frames
-                print(f"Geeky: Duplicated single image to create {required_frames} frames matching audio duration")
+                print(f"Pililink: Duplicated single image to create {required_frames} frames matching audio duration")
 
             log_timing("Processing audio")
             throw_if_processing_interrupted()
@@ -684,7 +718,7 @@ class GeekyLatentSyncNode:
             inference_temp = os.path.join(temp_dir, "temp")
             os.makedirs(inference_temp, exist_ok=True)
             
-            log_timing("Running Geeky inference")
+            log_timing("Running Pililink inference")
             throw_if_processing_interrupted()
             # Run inference
             inference_module.main(config, args)
@@ -713,12 +747,12 @@ class GeekyLatentSyncNode:
                     processed_frames = processed_frames.cpu()
 
             total_time = time.time() - start_time
-            print(f"Geeky total processing time: {total_time:.2f}s")
+            print(f"Pililink total processing time: {total_time:.2f}s")
             
             return (processed_frames, resampled_audio)
 
         except Exception as e:
-            print(f"Error during Geeky inference: {str(e)}")
+            print(f"Error during Pililink inference: {str(e)}")
             traceback.print_exc()
             raise
 
@@ -744,7 +778,7 @@ class GeekyLatentSyncNode:
                 torch.cuda.empty_cache()
 
 
-class GeekyVideoLengthAdjuster:
+class PililinkVideoLengthAdjuster:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -842,8 +876,8 @@ class GeekyVideoLengthAdjuster:
 
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
-    NODE_KEY_MAIN: GeekyLatentSyncNode,
-    NODE_KEY_ADJUSTER: GeekyVideoLengthAdjuster,
+    NODE_KEY_MAIN: PililinkLatentSyncNode,
+    NODE_KEY_ADJUSTER: PililinkVideoLengthAdjuster,
 }
 
 # Display Names for ComfyUI - Clear distinction from original
