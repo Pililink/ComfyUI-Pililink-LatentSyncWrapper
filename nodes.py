@@ -13,6 +13,7 @@ import time
 import traceback
 import uuid
 
+import numpy as np
 import requests
 import torch
 import torchaudio
@@ -796,12 +797,93 @@ class PililinkVideoLengthAdjuster:
     RETURN_NAMES = ("images", "audio")
     FUNCTION = "adjust"
 
+    def _check_memory_capacity(self, num_frames, frame_shape):
+        """Pre-check if we have enough memory for the target frames"""
+        try:
+            import psutil
+            # Rough estimate: each frame ~1-4MB depending on resolution
+            bytes_per_frame = frame_shape[0] * frame_shape[1] * frame_shape[2] * 4  # float32
+            required_bytes = num_frames * bytes_per_frame
+            required_mb = required_bytes / (1024 * 1024)
+            
+            # Get available memory
+            available_mb = psutil.virtual_memory().available / (1024 * 1024)
+            threshold_mb = max(1000, available_mb * 0.1)  # Keep 10% free or 1GB minimum
+            
+            if required_mb > available_mb - threshold_mb:
+                print(f"[Pililink WARNING] Estimated memory needed: {required_mb:.0f}MB, Available: {available_mb:.0f}MB")
+                print(f"[Pililink WARNING] Processing may be slow or fail. Consider shorter video duration.")
+                return False
+            return True
+        except (ImportError, Exception) as e:
+            # If psutil not available, do a basic memory check
+            if torch.cuda.is_available():
+                try:
+                    gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    print(f"[Pililink INFO] GPU memory: {gpu_mem:.1f}GB, Processing {num_frames} frames")
+                except:
+                    pass
+            return True
+
+    def _expand_frames_efficient(self, frame_indices, num_frames, total_frames_needed, fps):
+        """Efficiently expand frames using indexing instead of list concatenation
+        
+        Args:
+            frame_indices: List of indices to access frames
+            num_frames: Original number of frames
+            total_frames_needed: Target number of frames
+            fps: Frames per second (for progress reporting)
+        
+        Returns:
+            List of indices that efficiently tile the frames
+        """
+        if num_frames == 0:
+            return []
+        
+        if total_frames_needed <= num_frames:
+            return frame_indices[:total_frames_needed]
+        
+        # Use numpy for efficient indexing
+        indices = np.tile(frame_indices, math.ceil(total_frames_needed / num_frames))
+        return indices[:total_frames_needed].tolist()
+
+    def _create_pingpong_sequence(self, num_frames):
+        """Create a pingpong sequence: forward then backward"""
+        if num_frames <= 1:
+            return list(range(num_frames))
+        
+        # Forward sequence
+        forward = list(range(num_frames))
+        # Backward sequence (excluding first and last to avoid duplication)
+        backward = list(range(num_frames - 2, 0, -1))
+        
+        if len(backward) == 0:
+            return forward
+        
+        return forward + backward
+
     def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5):
+        throw_if_processing_interrupted()  # Add interruption check at start
+        
         waveform = audio["waveform"].squeeze(0)
         sample_rate = int(audio["sample_rate"])
-        original_frames = [images[i] for i in range(images.shape[0])] if isinstance(images, torch.Tensor) else images.copy()
-
+        
+        # Convert images tensor to list of frames
+        if isinstance(images, torch.Tensor):
+            original_frames = [images[i] for i in range(images.shape[0])]
+        else:
+            original_frames = images.copy()
+        
+        num_original_frames = len(original_frames)
+        
+        if num_original_frames == 0:
+            raise ValueError("Pililink: Input images cannot be empty")
+        
+        # Pre-check memory capacity
+        frame_shape = original_frames[0].shape if original_frames else images.shape[1:]
+        
         if mode == "normal":
+            throw_if_processing_interrupted()
             # Add silent padding to the audio and then trim video to match
             audio_duration = waveform.shape[1] / sample_rate
             
@@ -824,15 +906,19 @@ class PililinkVideoLengthAdjuster:
                 required_samples = int(len(original_frames) / fps * sample_rate)
                 padded_audio = padded_audio[:, :required_samples]
             
+            throw_if_processing_interrupted()
             return (
                 torch.stack(adjusted_frames),
                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
             )
 
         elif mode == "pingpong":
+            throw_if_processing_interrupted()
             video_duration = len(original_frames) / fps
             audio_duration = waveform.shape[1] / sample_rate
+            
             if audio_duration <= video_duration:
+                throw_if_processing_interrupted()
                 required_samples = int(video_duration * sample_rate)
                 silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
                 adjusted_audio = torch.cat([waveform, silence], dim=1)
@@ -843,34 +929,61 @@ class PililinkVideoLengthAdjuster:
                 )
 
             else:
+                throw_if_processing_interrupted()
                 silence_samples = math.ceil(silent_padding_sec * sample_rate)
                 silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
                 padded_audio = torch.cat([waveform, silence], dim=1)
                 total_duration = (waveform.shape[1] + silence_samples) / sample_rate
                 target_frames = math.ceil(total_duration * fps)
-                reversed_frames = original_frames[::-1][1:-1]  # Remove endpoints
-                frames = original_frames + reversed_frames
-                while len(frames) < target_frames:
-                    frames += frames[:target_frames - len(frames)]
+                
+                # Check memory before processing
+                self._check_memory_capacity(target_frames, frame_shape)
+                
+                # Create pingpong sequence
+                pingpong_indices = self._create_pingpong_sequence(num_original_frames)
+                pingpong_cycle_len = len(pingpong_indices)
+                
+                if pingpong_cycle_len == 0:
+                    raise ValueError("Pililink: Pingpong sequence is empty")
+                
+                # Use efficient indexed expansion
+                final_indices = self._expand_frames_efficient(
+                    pingpong_indices, pingpong_cycle_len, target_frames, fps
+                )
+                
+                # Create frame list by indexing (no memory duplication)
+                adjusted_frames = [original_frames[i] for i in final_indices[:target_frames]]
+                
+                throw_if_processing_interrupted()
                 return (
-                    torch.stack(frames[:target_frames]),
+                    torch.stack(adjusted_frames),
                     {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
                 )
 
         elif mode == "loop_to_audio":
+            throw_if_processing_interrupted()
             # Add silent padding then simple loop
             silence_samples = math.ceil(silent_padding_sec * sample_rate)
             silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
             padded_audio = torch.cat([waveform, silence], dim=1)
             total_duration = (waveform.shape[1] + silence_samples) / sample_rate
             target_frames = math.ceil(total_duration * fps)
-
-            frames = original_frames.copy()
-            while len(frames) < target_frames:
-                frames += original_frames[:target_frames - len(frames)]
             
+            # Check memory before processing
+            self._check_memory_capacity(target_frames, frame_shape)
+            
+            # Use efficient indexed expansion instead of list concatenation
+            loop_indices = list(range(num_original_frames))
+            final_indices = self._expand_frames_efficient(
+                loop_indices, num_original_frames, target_frames, fps
+            )
+            
+            # Create frame list by indexing (no memory duplication)
+            adjusted_frames = [original_frames[i] for i in final_indices[:target_frames]]
+            
+            throw_if_processing_interrupted()
             return (
-                torch.stack(frames[:target_frames]),
+                torch.stack(adjusted_frames),
                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
             )
 
