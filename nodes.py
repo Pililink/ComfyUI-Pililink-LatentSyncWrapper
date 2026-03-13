@@ -752,6 +752,17 @@ class PililinkLatentSyncNode:
             
             return (processed_frames, resampled_audio)
 
+        except RuntimeError as e:
+            if "Face not detected" in str(e) or "未检测到人脸" in str(e):
+                print(f"[Pililink] Face detection failed: {str(e)}")
+                raise RuntimeError(
+                    "未检测到人脸：输入视频中未能识别到人脸，请检查输入视频是否包含清晰的正面人脸。\n"
+                    "Face not detected: No face was found in the input video. "
+                    "Please ensure the video contains a clearly visible frontal face."
+                ) from e
+            print(f"Error during Pililink inference: {str(e)}")
+            traceback.print_exc()
+            raise
         except Exception as e:
             print(f"Error during Pililink inference: {str(e)}")
             traceback.print_exc()

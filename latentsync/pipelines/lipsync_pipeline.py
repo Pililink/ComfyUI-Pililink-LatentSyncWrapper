@@ -272,13 +272,54 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
+        last_good_face = None
+        last_good_box = None
+        last_good_affine_matrix = None
+        failed_indices = []
         print(f"Affine transforming {len(video_frames)} faces...")
-        for frame in tqdm.tqdm(video_frames):
+        for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             throw_if_processing_interrupted()
-            face, box, affine_matrix = self.image_processor.affine_transform(frame)
-            faces.append(face)
-            boxes.append(box)
-            affine_matrices.append(affine_matrix)
+            try:
+                face, box, affine_matrix = self.image_processor.affine_transform(frame)
+                last_good_face = face
+                last_good_box = box
+                last_good_affine_matrix = affine_matrix
+                faces.append(face)
+                boxes.append(box)
+                affine_matrices.append(affine_matrix)
+            except RuntimeError as e:
+                if "Face not detected" in str(e):
+                    failed_indices.append(idx)
+                    if last_good_face is not None:
+                        faces.append(last_good_face)
+                        boxes.append(last_good_box)
+                        affine_matrices.append(last_good_affine_matrix)
+                    else:
+                        faces.append(None)
+                        boxes.append(None)
+                        affine_matrices.append(None)
+                else:
+                    raise
+
+        if failed_indices:
+            print(f"[Pililink] Warning: Face not detected in {len(failed_indices)}/{len(video_frames)} frames")
+
+        # If no face was ever detected, raise a clear error
+        if last_good_face is None:
+            raise RuntimeError(
+                "未检测到人脸 (No face detected in any frame). "
+                "请确保输入视频中包含清晰可见的正面人脸。"
+                "Please ensure the input video contains a clearly visible frontal face."
+            )
+
+        # Back-fill any leading frames that had no face (before the first good detection)
+        for i in range(len(faces)):
+            if faces[i] is None:
+                faces[i] = last_good_face
+                boxes[i] = last_good_box
+                affine_matrices[i] = last_good_affine_matrix
+            else:
+                break
 
         faces = torch.stack(faces)
         return faces, boxes, affine_matrices
