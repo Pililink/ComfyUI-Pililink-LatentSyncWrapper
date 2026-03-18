@@ -16,6 +16,8 @@ import os
 import imageio
 import numpy as np
 import json
+import queue
+import threading
 from typing import Union
 import matplotlib.pyplot as plt
 
@@ -34,6 +36,7 @@ import subprocess
 
 # Machine epsilon for a float32 (single precision)
 eps = np.finfo(np.float32).eps
+_FFMPEG_VIDEO_ENCODERS = None
 
 
 def read_json(filepath: str):
@@ -42,17 +45,119 @@ def read_json(filepath: str):
     return json_dict
 
 
+def get_available_ffmpeg_video_encoders():
+    global _FFMPEG_VIDEO_ENCODERS
+    if _FFMPEG_VIDEO_ENCODERS is not None:
+        return _FFMPEG_VIDEO_ENCODERS
+
+    encoders = set()
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        output = "\n".join([result.stdout or "", result.stderr or ""])
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or line.startswith("-"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            flags = parts[0]
+            if "V" in flags:
+                encoders.add(parts[1])
+    except Exception:
+        pass
+
+    _FFMPEG_VIDEO_ENCODERS = encoders
+    return _FFMPEG_VIDEO_ENCODERS
+
+
+def get_preferred_ffmpeg_video_codec():
+    available_encoders = get_available_ffmpeg_video_encoders()
+    for codec in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+        if codec == "libx264" or codec in available_encoders:
+            return codec
+    return "libx264"
+
+
+def get_ffmpeg_video_encode_args(codec=None):
+    codec = codec or get_preferred_ffmpeg_video_codec()
+    if codec == "h264_nvenc":
+        return ["-c:v", codec, "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
+    if codec == "h264_qsv":
+        return ["-c:v", codec, "-global_quality", "21", "-pix_fmt", "yuv420p"]
+    if codec == "h264_amf":
+        return ["-c:v", codec, "-quality", "balanced", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p"]
+
+
+def run_ffmpeg_command(command, error_message):
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr_message = (result.stderr or result.stdout or "").strip()
+        if stderr_message:
+            raise RuntimeError(f"{error_message} (exit code {result.returncode}): {stderr_message}")
+        raise RuntimeError(f"{error_message} (exit code {result.returncode})")
+
+
+def run_ffmpeg_video_command_with_fallback(command_builder, error_message):
+    preferred_codec = get_preferred_ffmpeg_video_codec()
+    codecs_to_try = [preferred_codec]
+    if preferred_codec != "libx264":
+        codecs_to_try.append("libx264")
+
+    last_error = None
+    for codec in codecs_to_try:
+        try:
+            run_ffmpeg_command(command_builder(codec), error_message)
+            if codec != preferred_codec:
+                print(f"LatentSync util: ffmpeg video encoder fallback succeeded with {codec}")
+            return
+        except RuntimeError as exc:
+            last_error = exc
+            if codec != "libx264":
+                print(f"LatentSync util: ffmpeg video encoder {codec} failed, retrying with libx264")
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+
+
 def read_video(video_path: str, change_fps=True, use_decord=True):
     if change_fps:
         temp_dir = "temp"
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
-        command = (
-            f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
-        )
-        subprocess.run(command, shell=True)
         target_video_path = os.path.join(temp_dir, "video.mp4")
+        run_ffmpeg_video_command_with_fallback(
+            lambda codec: [
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-y",
+                "-nostdin",
+                "-i",
+                video_path,
+                "-r",
+                "25",
+                *get_ffmpeg_video_encode_args(codec),
+                target_video_path,
+            ],
+            f"Failed to normalize video fps: {video_path}",
+        )
     else:
         target_video_path = video_path
 
@@ -69,23 +174,22 @@ def prepare_video_for_processing(video_path: str, change_fps=True, temp_dir="tem
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         target_video_path = os.path.join(temp_dir, "video.mp4")
-        command = [
-            "ffmpeg",
-            "-loglevel",
-            "error",
-            "-y",
-            "-nostdin",
-            "-i",
-            video_path,
-            "-r",
-            "25",
-            "-crf",
-            "18",
-            target_video_path,
-        ]
-        result = subprocess.run(command)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to normalize input video: {video_path}")
+        run_ffmpeg_video_command_with_fallback(
+            lambda codec: [
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-y",
+                "-nostdin",
+                "-i",
+                video_path,
+                "-r",
+                "25",
+                *get_ffmpeg_video_encode_args(codec),
+                target_video_path,
+            ],
+            f"Failed to normalize input video: {video_path}",
+        )
         return target_video_path
     return video_path
 
@@ -99,7 +203,43 @@ def get_video_frame_count(video_path: str):
     return frame_count
 
 
-def iter_video_cv2(video_path: str, chunk_size: int):
+def estimate_video_chunk_bytes(video_path: str, chunk_size: int):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video for chunk size estimate: {video_path}")
+    try:
+        ret, frame = cap.read()
+        if not ret:
+            return 0
+        return int(frame.nbytes * max(chunk_size, 1))
+    finally:
+        cap.release()
+
+
+def resolve_video_prefetch_chunks(video_path: str, chunk_size: int, prefetch_chunks: int = None):
+    if prefetch_chunks is not None:
+        return max(1, int(prefetch_chunks))
+
+    default_prefetch = 2
+    try:
+        import psutil
+
+        chunk_bytes = estimate_video_chunk_bytes(video_path, chunk_size)
+        if chunk_bytes <= 0:
+            return 1
+
+        available_bytes = int(psutil.virtual_memory().available)
+        ram_budget_bytes = min(int(available_bytes * 0.30), 6 * 1024 * 1024 * 1024)
+        if ram_budget_bytes <= chunk_bytes:
+            return 1
+
+        adaptive_prefetch = ram_budget_bytes // chunk_bytes
+        return max(1, min(8, int(adaptive_prefetch)))
+    except Exception:
+        return default_prefetch
+
+
+def iter_video_cv2_sync(video_path: str, chunk_size: int, interrupt_checker=None):
     """Yield RGB frame chunks from a video path using cv2."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -108,6 +248,8 @@ def iter_video_cv2(video_path: str, chunk_size: int):
     frames = []
     try:
         while True:
+            if interrupt_checker is not None:
+                interrupt_checker()
             ret, frame = cap.read()
             if not ret:
                 break
@@ -120,6 +262,82 @@ def iter_video_cv2(video_path: str, chunk_size: int):
             yield np.array(frames)
     finally:
         cap.release()
+
+
+def iter_video_cv2(video_path: str, chunk_size: int, prefetch_chunks: int = None, interrupt_checker=None):
+    resolved_prefetch_chunks = resolve_video_prefetch_chunks(video_path, chunk_size, prefetch_chunks=prefetch_chunks)
+    if resolved_prefetch_chunks <= 1:
+        yield from iter_video_cv2_sync(video_path, chunk_size, interrupt_checker=interrupt_checker)
+        return
+
+    chunk_queue = queue.Queue(maxsize=resolved_prefetch_chunks)
+    stop_event = threading.Event()
+    sentinel = object()
+    reader_errors = []
+
+    print(f"Pililink: Video RAM prefetch enabled with {resolved_prefetch_chunks} chunks")
+
+    def put_with_backpressure(item):
+        while not stop_event.is_set():
+            try:
+                chunk_queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def reader():
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            reader_errors.append(RuntimeError(f"Could not open video for streaming read: {video_path}"))
+            put_with_backpressure(sentinel)
+            return
+
+        frames = []
+        try:
+            while not stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(frame_rgb)
+                if len(frames) >= chunk_size:
+                    if not put_with_backpressure(np.array(frames)):
+                        return
+                    frames = []
+            if frames:
+                put_with_backpressure(np.array(frames))
+        except Exception as exc:
+            reader_errors.append(exc)
+        finally:
+            cap.release()
+            put_with_backpressure(sentinel)
+
+    reader_thread = threading.Thread(target=reader, name="pililink_video_prefetch", daemon=True)
+    reader_thread.start()
+
+    try:
+        while True:
+            if interrupt_checker is not None:
+                interrupt_checker()
+            try:
+                item = chunk_queue.get(timeout=0.1)
+            except queue.Empty:
+                if reader_errors:
+                    raise reader_errors[0]
+                if not reader_thread.is_alive() and chunk_queue.empty():
+                    break
+                continue
+
+            if item is sentinel:
+                break
+            yield item
+
+        if reader_errors:
+            raise reader_errors[0]
+    finally:
+        stop_event.set()
+        reader_thread.join(timeout=1.0)
 
 
 def read_video_decord(video_path: str):

@@ -26,6 +26,7 @@
 
 4. **节点命名（Pililink）**
    - 主节点：`Pililink LatentSync 1.5`
+   - 路径版节点：`Pililink LatentSync 1.5 (Video Path)`
    - 辅助节点：`Pililink LatentSync Length Adjuster`
 
 ---
@@ -51,6 +52,8 @@ pip install -r requirements.txt
 - 系统可用 `ffmpeg`（需在 PATH 中）
 
 首次运行会自动检查并下载所需模型文件。
+
+建议同时安装 `DeepCache`，它会在 CUDA 环境下自动启用，用来减少推理阶段的重复 UNet 计算并提升速度。
 
 ---
 
@@ -90,9 +93,58 @@ latensync1.5/
 
 ---
 
+## 节点参数说明（路径版节点）
+
+- `video_path`：本地视频绝对路径
+- `audio`：可选，ComfyUI 音频输入
+- `audio_path`：可选，本地音频绝对路径；填写后优先于 `audio`
+- `mode`：时长对齐模式，支持 `normal` / `pingpong` / `loop_to_audio`
+- `silent_padding_sec`：补齐音频时附加的静音秒数
+- `face_roi_pre_crop`：面部预裁剪模式，支持 `off` / `auto` / `force`
+- `roi_padding_ratio`：面部 ROI 额外留白比例，避免嘴部和下巴出框
+- `roi_sample_frames`：用于检测稳定人脸 ROI 的采样帧数
+- `filename_prefix`：输出到 ComfyUI `output` 目录时使用的前缀
+- `output_path`：可选，直接指定最终输出 mp4 的绝对路径
+- `seed` / `lips_expression` / `inference_steps` / `vram_usage` / `segment_inferences`：与主节点一致
+
+路径版节点会直接读取源视频路径并输出保存后的 mp4 路径，不再把整段长视频展开成 `IMAGE` 批量输入，因此更适合长视频。
+
+如果 `audio` 和 `audio_path` 都留空，节点会自动尝试提取输入视频自带音轨作为驱动音频。
+
+时长模式说明：
+
+- `normal`：对齐到较短一侧；如果视频比音频长，会先给音频补一小段静音再裁视频；如果音频比视频长，则裁音频
+- `pingpong`：当音频比视频长时，把视频做往返播放扩展到音频时长；当音频较短时，保留原视频并给音频补静音
+- `loop_to_audio`：循环视频直到覆盖音频时长，并可附加静音尾巴
+
+面部预裁剪模式说明：
+
+- `off`：关闭，保持当前全帧流程
+- `auto`：先尝试检测稳定面部 ROI，裁脸推理后再贴回；如果失败会自动回退到全帧流程
+- `force`：强制走面部 ROI 裁剪链路；如果 ROI 检测或合并失败则直接报错
+
+---
+
+## 长视频推荐工作流
+
+长视频尽量不要走 `Load Video (Upload) 🎥🅥🅗🅢 -> IMAGE` 这条链路，因为它会在进入 Pililink 之前先把整段视频展开到内存。
+
+推荐改成：
+
+```text
+字符串路径 / 路径输入节点
+        -> Pililink LatentSync 1.5 (Video Path)
+        -> 输出 mp4 路径
+```
+
+如果还需要单独加载音频，可继续使用音频节点接到 `audio` 输入；如果视频原音就是驱动音频，可以直接只填 `video_path`。
+
+---
+
 ## 输出与行为
 
 - 输出：处理后视频帧 + 音频（ComfyUI 标准输出）
+- 路径版输出：保存后的 `mp4` 路径 + 文件名
 - 执行中可在 ComfyUI 中断（Stop）
 - 临时文件在节点运行目录下自动管理
 
@@ -102,6 +154,7 @@ latensync1.5/
 
 - 输入视频会按流程要求处理为 25fps 路径后再推理
 - 对超长视频，速度会下降但稳定性更高（这是分段策略的预期）
+- 如果已安装 `DeepCache`，当前版本会自动启用；如需临时排查兼容问题，可设置环境变量 `PILILINK_DISABLE_DEEPCACHE=1` 后再启动 ComfyUI
 
 ---
 

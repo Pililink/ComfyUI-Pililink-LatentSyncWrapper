@@ -13,6 +13,7 @@ import time
 import traceback
 import uuid
 
+import cv2
 import numpy as np
 import requests
 import torch
@@ -58,8 +59,12 @@ TORCH_CACHE_DIR = _LATENTSYNC_PATHS["torch_cache_dir"]
 NODE_CATEGORY = "PililinkLatentSync"
 NODE_KEY_MAIN = "PililinkLatentSyncNode"
 NODE_KEY_ADJUSTER = "PililinkLatentSyncLengthAdjuster"
+NODE_KEY_MAIN_PATH = "PililinkLatentSyncVideoPathNode"
 NODE_DISPLAY_MAIN = "Pililink LatentSync 1.5"
 NODE_DISPLAY_ADJUSTER = "Pililink LatentSync Length Adjuster"
+NODE_DISPLAY_MAIN_PATH = "Pililink LatentSync 1.5 (Video Path)"
+_FFMPEG_VIDEO_ENCODERS = None
+_FACE_ROI_DETECTORS = {}
 
 # Function to check for potential conflicts with other LatentSync implementations
 def check_for_conflicts():
@@ -436,7 +441,676 @@ def setup_models():
         print(f"   with whisper/tiny.pt in: {whisper_dir}")
         raise RuntimeError("Pililink model download failed. See instructions above.")
 
-class PililinkLatentSyncNode:
+def resolve_user_path(path_value, input_name):
+    if path_value is None:
+        raise ValueError(f"Pililink: {input_name} is required")
+
+    resolved_path = str(path_value).strip().strip('"').strip("'")
+    if not resolved_path:
+        raise ValueError(f"Pililink: {input_name} cannot be empty")
+
+    resolved_path = os.path.abspath(os.path.expandvars(os.path.expanduser(resolved_path)))
+    if not os.path.exists(resolved_path):
+        raise FileNotFoundError(f"Pililink: {input_name} not found: {resolved_path}")
+
+    return resolved_path
+
+
+def get_available_ffmpeg_video_encoders():
+    global _FFMPEG_VIDEO_ENCODERS
+    if _FFMPEG_VIDEO_ENCODERS is not None:
+        return _FFMPEG_VIDEO_ENCODERS
+
+    encoders = set()
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        output = "\n".join([result.stdout or "", result.stderr or ""])
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or line.startswith("-"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            flags = parts[0]
+            if "V" in flags:
+                encoders.add(parts[1])
+    except Exception:
+        pass
+
+    _FFMPEG_VIDEO_ENCODERS = encoders
+    return _FFMPEG_VIDEO_ENCODERS
+
+
+def get_preferred_ffmpeg_video_codec():
+    available_encoders = get_available_ffmpeg_video_encoders()
+    for codec in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+        if codec == "libx264" or codec in available_encoders:
+            return codec
+    return "libx264"
+
+
+def get_ffmpeg_video_encode_args(codec=None):
+    codec = codec or get_preferred_ffmpeg_video_codec()
+    if codec == "h264_nvenc":
+        return ["-c:v", codec, "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
+    if codec == "h264_qsv":
+        return ["-c:v", codec, "-global_quality", "21", "-pix_fmt", "yuv420p"]
+    if codec == "h264_amf":
+        return ["-c:v", codec, "-quality", "balanced", "-pix_fmt", "yuv420p"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p"]
+
+
+def get_output_video_path(filename_prefix, output_path=""):
+    output_path = str(output_path or "").strip().strip('"').strip("'")
+    if output_path:
+        resolved_output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
+        root, ext = os.path.splitext(resolved_output_path)
+        if not ext:
+            resolved_output_path = root + ".mp4"
+        output_dir = os.path.dirname(resolved_output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        return resolved_output_path, os.path.basename(resolved_output_path)
+
+    output_dir = folder_paths.get_output_directory()
+    try:
+        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(filename_prefix, output_dir)
+    except TypeError:
+        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(filename_prefix, output_dir, 0, 0)
+
+    os.makedirs(full_output_folder, exist_ok=True)
+    output_filename = f"{filename}_{counter:05d}.mp4"
+    return os.path.join(full_output_folder, output_filename), output_filename
+
+
+def save_audio_input(audio, target_audio_path):
+    if audio is None:
+        raise ValueError("Pililink: audio input is required")
+
+    # ComfyUI may execute nodes under torch.inference_mode().
+    # Some audio ops (for example torchaudio resampling) expect normal tensors.
+    with torch.inference_mode(False):
+        waveform = audio["waveform"].detach().clone().cpu()
+        sample_rate = int(audio["sample_rate"])
+        if waveform.dim() == 3:
+            waveform = waveform.squeeze(0)
+
+        if sample_rate != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=16000)
+            waveform = resampler(waveform)
+            sample_rate = 16000
+
+        torchaudio.save(target_audio_path, waveform.cpu(), sample_rate)
+        return {
+            "waveform": waveform.unsqueeze(0),
+            "sample_rate": sample_rate,
+        }
+
+
+def run_process_with_interrupt(command, error_message, shell=False):
+    process = None
+    stdout = ""
+    stderr = ""
+    try:
+        throw_if_processing_interrupted()
+        process = subprocess.Popen(
+            command,
+            shell=shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        while process.poll() is None:
+            throw_if_processing_interrupted()
+            time.sleep(0.1)
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            stderr_message = (stderr or stdout or "").strip()
+            if stderr_message:
+                raise RuntimeError(f"{error_message} (exit code {process.returncode}): {stderr_message}")
+            raise RuntimeError(f"{error_message} (exit code {process.returncode})")
+    except Exception:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                process.kill()
+        raise
+
+
+def run_ffmpeg_video_command_with_fallback(command_builder, error_message):
+    preferred_codec = get_preferred_ffmpeg_video_codec()
+    codecs_to_try = [preferred_codec]
+    if preferred_codec != "libx264":
+        codecs_to_try.append("libx264")
+
+    last_error = None
+    for codec in codecs_to_try:
+        try:
+            run_process_with_interrupt(command_builder(codec), error_message)
+            if codec != preferred_codec:
+                print(f"Pililink: ffmpeg video encoder fallback succeeded with {codec}")
+            return
+        except RuntimeError as exc:
+            last_error = exc
+            if codec != "libx264":
+                print(f"Pililink: ffmpeg video encoder {codec} failed, retrying with libx264")
+                continue
+            raise
+
+    if last_error is not None:
+        raise last_error
+
+
+def extract_audio_from_video(video_path, target_audio_path):
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        video_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        target_audio_path,
+    ]
+    run_process_with_interrupt(command, f"Failed to extract audio from video: {video_path}")
+    if not os.path.exists(target_audio_path):
+        raise RuntimeError(f"Pililink: extracted audio file missing: {target_audio_path}")
+    return target_audio_path
+
+
+def run_small_process_with_interrupt_capture(command, error_message, shell=False):
+    process = None
+    stdout = ""
+    stderr = ""
+    try:
+        throw_if_processing_interrupted()
+        process = subprocess.Popen(
+            command,
+            shell=shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        while process.poll() is None:
+            throw_if_processing_interrupted()
+            time.sleep(0.1)
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            stderr_message = (stderr or "").strip()
+            if stderr_message:
+                raise RuntimeError(f"{error_message} (exit code {process.returncode}): {stderr_message}")
+            raise RuntimeError(f"{error_message} (exit code {process.returncode})")
+        return stdout
+    except Exception:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except Exception:
+                process.kill()
+        raise
+
+
+def probe_media_duration(media_path, media_kind):
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        media_path,
+    ]
+    output = run_small_process_with_interrupt_capture(
+        command,
+        f"Failed to probe {media_kind} duration: {media_path}",
+    )
+    try:
+        duration = float(str(output).strip())
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Pililink: invalid {media_kind} duration reported for {media_path}: {output!r}") from exc
+    if duration <= 0:
+        raise RuntimeError(f"Pililink: {media_kind} duration must be positive: {media_path}")
+    return duration
+
+
+def adjust_audio_duration(audio_path, target_audio_path, target_duration):
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        audio_path,
+        "-af",
+        "apad",
+        "-t",
+        f"{target_duration:.6f}",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        target_audio_path,
+    ]
+    run_process_with_interrupt(command, f"Failed to adjust audio duration: {audio_path}")
+    if not os.path.exists(target_audio_path):
+        raise RuntimeError(f"Pililink: adjusted audio file missing: {target_audio_path}")
+    return target_audio_path
+
+
+def trim_video_to_duration(video_path, target_video_path, target_duration):
+    def build_command(codec):
+        return [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-t",
+            f"{target_duration:.6f}",
+            "-an",
+            *get_ffmpeg_video_encode_args(codec),
+            target_video_path,
+        ]
+
+    run_ffmpeg_video_command_with_fallback(build_command, f"Failed to trim video duration: {video_path}")
+    if not os.path.exists(target_video_path):
+        raise RuntimeError(f"Pililink: trimmed video file missing: {target_video_path}")
+    return target_video_path
+
+
+def loop_video_to_duration(video_path, target_video_path, target_duration):
+    def build_command(codec):
+        return [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-stream_loop",
+            "-1",
+            "-i",
+            video_path,
+            "-t",
+            f"{target_duration:.6f}",
+            "-an",
+            *get_ffmpeg_video_encode_args(codec),
+            target_video_path,
+        ]
+
+    run_ffmpeg_video_command_with_fallback(build_command, f"Failed to loop video to target duration: {video_path}")
+    if not os.path.exists(target_video_path):
+        raise RuntimeError(f"Pililink: looped video file missing: {target_video_path}")
+    return target_video_path
+
+
+def create_pingpong_cycle(video_path, cycle_video_path):
+    def build_command(codec):
+        return [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-filter_complex",
+            "[0:v]split[fwd][tmp];[tmp]reverse[rev];[fwd][rev]concat=n=2:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-an",
+            *get_ffmpeg_video_encode_args(codec),
+            cycle_video_path,
+        ]
+
+    run_ffmpeg_video_command_with_fallback(build_command, f"Failed to create pingpong video cycle: {video_path}")
+    if not os.path.exists(cycle_video_path):
+        raise RuntimeError(f"Pililink: pingpong cycle video missing: {cycle_video_path}")
+    return cycle_video_path
+
+
+def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, temp_dir):
+    duration_epsilon = 0.05
+    video_duration = probe_media_duration(video_path, "video")
+    audio_duration = probe_media_duration(audio_path, "audio")
+
+    resolved_mode = str(mode or "normal")
+    if resolved_mode not in {"normal", "pingpong", "loop_to_audio"}:
+        raise ValueError(f"Pililink: unsupported length mode: {resolved_mode}")
+
+    resolved_video_path = video_path
+    resolved_audio_path = audio_path
+
+    def needs_adjustment(current_duration, target_duration):
+        return abs(current_duration - target_duration) > duration_epsilon
+
+    def build_temp_path(stem):
+        return os.path.join(temp_dir, stem)
+
+    if resolved_mode == "normal":
+        target_duration = min(video_duration, audio_duration + silent_padding_sec)
+        if target_duration < video_duration - duration_epsilon:
+            resolved_video_path = trim_video_to_duration(
+                video_path,
+                build_temp_path("pililink_length_normal_video.mp4"),
+                target_duration,
+            )
+        if needs_adjustment(audio_duration, target_duration):
+            resolved_audio_path = adjust_audio_duration(
+                audio_path,
+                build_temp_path("pililink_length_normal_audio.wav"),
+                target_duration,
+            )
+    elif resolved_mode == "pingpong":
+        if audio_duration <= video_duration + duration_epsilon:
+            target_duration = video_duration
+            if needs_adjustment(audio_duration, target_duration):
+                resolved_audio_path = adjust_audio_duration(
+                    audio_path,
+                    build_temp_path("pililink_length_pingpong_audio.wav"),
+                    target_duration,
+                )
+        else:
+            target_duration = audio_duration + silent_padding_sec
+            resolved_audio_path = adjust_audio_duration(
+                audio_path,
+                build_temp_path("pililink_length_pingpong_audio.wav"),
+                target_duration,
+            )
+            pingpong_cycle_path = create_pingpong_cycle(
+                video_path,
+                build_temp_path("pililink_length_pingpong_cycle.mp4"),
+            )
+            resolved_video_path = loop_video_to_duration(
+                pingpong_cycle_path,
+                build_temp_path("pililink_length_pingpong_video.mp4"),
+                target_duration,
+            )
+    else:
+        target_duration = audio_duration + silent_padding_sec
+        if needs_adjustment(audio_duration, target_duration):
+            resolved_audio_path = adjust_audio_duration(
+                audio_path,
+                build_temp_path("pililink_length_loop_audio.wav"),
+                target_duration,
+            )
+        if target_duration < video_duration - duration_epsilon:
+            resolved_video_path = trim_video_to_duration(
+                video_path,
+                build_temp_path("pililink_length_loop_video.mp4"),
+                target_duration,
+            )
+        elif target_duration > video_duration + duration_epsilon:
+            resolved_video_path = loop_video_to_duration(
+                video_path,
+                build_temp_path("pililink_length_loop_video.mp4"),
+                target_duration,
+            )
+
+    print(
+        "Pililink: Length mode "
+        f"{resolved_mode}, video {video_duration:.3f}s, audio {audio_duration:.3f}s"
+    )
+    if resolved_video_path != video_path or resolved_audio_path != audio_path:
+        print(
+            "Pililink: Prepared aligned inputs "
+            f"video={resolved_video_path}, audio={resolved_audio_path}"
+        )
+
+    return resolved_video_path, resolved_audio_path
+
+
+def get_face_roi_detector(device_str):
+    global _FACE_ROI_DETECTORS
+
+    normalized_device = "cuda" if device_str == "cuda" and torch.cuda.is_available() else "cpu"
+    detector = _FACE_ROI_DETECTORS.get(normalized_device)
+    if detector is not None:
+        return detector
+
+    try:
+        import face_alignment
+    except Exception as exc:
+        raise RuntimeError("Pililink: face-alignment is required for face ROI pre-crop mode") from exc
+
+    detector = face_alignment.FaceAlignment(
+        face_alignment.LandmarksType.TWO_D,
+        flip_input=False,
+        device=normalized_device,
+    )
+    _FACE_ROI_DETECTORS[normalized_device] = detector
+    return detector
+
+
+def ensure_even_face_roi(roi, frame_width, frame_height):
+    x = int(max(0, min(frame_width - 2, roi["x"])))
+    y = int(max(0, min(frame_height - 2, roi["y"])))
+    w = int(max(2, min(frame_width - x, roi["w"])))
+    h = int(max(2, min(frame_height - y, roi["h"])))
+
+    if x % 2 != 0:
+        x = max(0, x - 1)
+    if y % 2 != 0:
+        y = max(0, y - 1)
+    if w % 2 != 0:
+        w = max(2, w - 1)
+    if h % 2 != 0:
+        h = max(2, h - 1)
+
+    if x + w > frame_width:
+        w = frame_width - x
+        if w % 2 != 0:
+            w = max(2, w - 1)
+    if y + h > frame_height:
+        h = frame_height - y
+        if h % 2 != 0:
+            h = max(2, h - 1)
+
+    if w < 2 or h < 2:
+        raise RuntimeError("Pililink: invalid face ROI computed for pre-crop mode")
+
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def build_face_roi_from_landmarks(landmarks, frame_width, frame_height, padding_ratio):
+    padding_ratio = max(0.0, float(padding_ratio))
+    min_x = float(np.min(landmarks[:, 0]))
+    max_x = float(np.max(landmarks[:, 0]))
+    min_y = float(np.min(landmarks[:, 1]))
+    max_y = float(np.max(landmarks[:, 1]))
+
+    base_width = max(2.0, max_x - min_x)
+    base_height = max(2.0, max_y - min_y)
+    horizontal_padding = base_width * padding_ratio
+    top_padding = base_height * padding_ratio * 0.8
+    bottom_padding = base_height * padding_ratio * 1.35
+
+    roi = {
+        "x": int(round(min_x - horizontal_padding)),
+        "y": int(round(min_y - top_padding)),
+        "w": int(round(base_width + horizontal_padding * 2)),
+        "h": int(round(base_height + top_padding + bottom_padding)),
+    }
+    return ensure_even_face_roi(roi, frame_width, frame_height)
+
+
+def select_stable_face_roi(rois):
+    if not rois:
+        raise RuntimeError("Pililink: no face ROI candidates were collected")
+
+    if len(rois) == 1:
+        return rois[0]
+
+    roi_array = np.array([[roi["x"], roi["y"], roi["w"], roi["h"]] for roi in rois], dtype=np.float32)
+    roi_median = np.median(roi_array, axis=0)
+    distances = np.abs(roi_array - roi_median).sum(axis=1)
+    best_index = int(np.argmin(distances))
+    return rois[best_index]
+
+
+def detect_face_roi_for_video(video_path, device_str, padding_ratio=0.35, sample_frames=12, max_detection_size=960):
+    detector = get_face_roi_detector(device_str)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Pililink: failed to open video for face ROI detection: {video_path}")
+
+    rois = []
+    try:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total_frames <= 0:
+            sample_indices = [0]
+        else:
+            sample_count = max(1, min(int(sample_frames), total_frames))
+            if sample_count == 1:
+                sample_indices = [0]
+            else:
+                sample_indices = sorted(
+                    {
+                        int(round(index * (total_frames - 1) / (sample_count - 1)))
+                        for index in range(sample_count)
+                    }
+                )
+
+        for frame_index in sample_indices:
+            throw_if_processing_interrupted()
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            success, frame_bgr = cap.read()
+            if not success or frame_bgr is None:
+                continue
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_height, frame_width = frame_rgb.shape[:2]
+            detection_frame = frame_rgb
+            scale = 1.0
+            max_dim = max(frame_width, frame_height)
+            if max_dim > max_detection_size:
+                scale = max_detection_size / float(max_dim)
+                detection_frame = cv2.resize(
+                    frame_rgb,
+                    (max(2, int(round(frame_width * scale))), max(2, int(round(frame_height * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+            detected_faces = detector.get_landmarks(detection_frame)
+            if not detected_faces:
+                continue
+
+            largest_landmarks = None
+            largest_area = -1.0
+            for landmarks in detected_faces:
+                landmarks = np.asarray(landmarks, dtype=np.float32)
+                width = float(np.max(landmarks[:, 0]) - np.min(landmarks[:, 0]))
+                height = float(np.max(landmarks[:, 1]) - np.min(landmarks[:, 1]))
+                area = width * height
+                if area > largest_area:
+                    largest_area = area
+                    largest_landmarks = landmarks
+
+            if largest_landmarks is None:
+                continue
+
+            if scale != 1.0:
+                largest_landmarks = largest_landmarks / scale
+
+            rois.append(build_face_roi_from_landmarks(largest_landmarks, frame_width, frame_height, padding_ratio))
+    finally:
+        cap.release()
+
+    if not rois:
+        raise RuntimeError("Face not detected")
+
+    selected_roi = select_stable_face_roi(rois)
+    print(f"Pililink: Selected face ROI {selected_roi}")
+    return selected_roi
+
+
+def crop_video_to_face_roi(video_path, output_path, roi):
+    def build_command(codec):
+        return [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-filter:v",
+            f"crop={roi['w']}:{roi['h']}:{roi['x']}:{roi['y']}",
+            "-an",
+            *get_ffmpeg_video_encode_args(codec),
+            output_path,
+        ]
+
+    run_ffmpeg_video_command_with_fallback(build_command, f"Failed to crop face ROI from video: {video_path}")
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"Pililink: cropped face ROI video missing: {output_path}")
+    return output_path
+
+
+def merge_face_result_back(background_video_path, face_result_video_path, output_path, roi):
+    def build_command(codec):
+        return [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            background_video_path,
+            "-i",
+            face_result_video_path,
+            "-filter_complex",
+            (
+                f"[1:v]scale={roi['w']}:{roi['h']}[face];"
+                f"[0:v][face]overlay={roi['x']}:{roi['y']}:shortest=1[v]"
+            ),
+            "-map",
+            "[v]",
+            "-map",
+            "1:a?",
+            *get_ffmpeg_video_encode_args(codec),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+
+    run_ffmpeg_video_command_with_fallback(
+        build_command,
+        f"Failed to merge lip-synced face ROI back to video: {background_video_path}",
+    )
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"Pililink: merged face ROI video missing: {output_path}")
+    return output_path
+
+
+class PililinkLatentSyncBase:
     def __init__(self):
         # Make sure our temp directory is the current one
         global MODULE_TEMP_DIR
@@ -445,6 +1119,234 @@ class PililinkLatentSyncNode:
         
         check_and_install_dependencies()
         setup_models()
+
+    def _prepare_execution_settings(self, inference_steps, vram_usage):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        use_mixed_precision = False
+
+        if torch.cuda.is_available():
+            if vram_usage == "high":
+                batch_size = min(32, 120 // inference_steps)
+                use_mixed_precision = True
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True if hasattr(torch.backends.cuda, "matmul") else False
+                torch.backends.cudnn.allow_tf32 = True
+                torch.cuda.set_per_process_memory_fraction(0.95)
+                print(f"Using Pililink high VRAM settings with {batch_size} batch size")
+            elif vram_usage == "medium":
+                batch_size = min(16, 80 // inference_steps)
+                use_mixed_precision = True
+                torch.backends.cudnn.benchmark = True
+                torch.cuda.set_per_process_memory_fraction(0.85)
+                print(f"Using Pililink medium VRAM settings with {batch_size} batch size")
+            else:
+                batch_size = min(8, 40 // inference_steps)
+                use_mixed_precision = False
+                torch.cuda.set_per_process_memory_fraction(0.75)
+                print(f"Using Pililink low VRAM settings with {batch_size} batch size")
+
+            torch.cuda.empty_cache()
+        else:
+            batch_size = 4
+            print("No GPU detected, using CPU with minimal batch size")
+
+        return {
+            "device": device,
+            "batch_size": batch_size,
+            "use_mixed_precision": use_mixed_precision,
+        }
+
+    def _create_run_temp_dir(self):
+        global MODULE_TEMP_DIR
+        run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
+        temp_dir = os.path.join(MODULE_TEMP_DIR, f"pililink_run_{run_id}")
+        os.makedirs(temp_dir, exist_ok=True)
+        return run_id, temp_dir
+
+    def _build_inference_args(
+        self,
+        video_path,
+        audio_path,
+        output_video_path,
+        seed,
+        lips_expression,
+        inference_steps,
+        segment_inferences,
+        temp_dir,
+        execution_settings,
+    ):
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
+        inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
+        config_path = os.path.join(cur_dir, "configs", "unet", "stage2.yaml")
+        scheduler_config_path = os.path.join(cur_dir, "configs")
+        ckpt_path = get_latentsync_path("latentsync_unet.pt")
+        whisper_ckpt_path = get_latentsync_path("whisper", "tiny.pt")
+
+        config = OmegaConf.load(config_path)
+
+        mask_image_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
+        if not os.path.exists(mask_image_path):
+            alt_mask_path = os.path.join(cur_dir, "utils", "mask.png")
+            if os.path.exists(alt_mask_path):
+                mask_image_path = alt_mask_path
+            else:
+                print("Warning: Could not find mask image at expected locations")
+
+        if hasattr(config, "data") and hasattr(config.data, "mask_image_path"):
+            config.data.mask_image_path = mask_image_path
+
+        args = argparse.Namespace(
+            unet_config_path=config_path,
+            inference_ckpt_path=ckpt_path,
+            video_path=video_path,
+            audio_path=audio_path,
+            video_out_path=output_video_path,
+            seed=seed,
+            inference_steps=inference_steps,
+            guidance_scale=lips_expression,
+            scheduler_config_path=scheduler_config_path,
+            whisper_ckpt_path=whisper_ckpt_path,
+            device=execution_settings["device"],
+            batch_size=execution_settings["batch_size"],
+            use_mixed_precision=execution_settings["use_mixed_precision"],
+            temp_dir=temp_dir,
+            segment_inferences=segment_inferences,
+            mask_image_path=mask_image_path,
+            latentsync_root=LATENTSYNC_ROOT_DIR,
+            hf_cache_dir=HF_CACHE_DIR,
+            audio_embeds_cache_dir=get_latentsync_path("runtime_cache", "audio_embeds"),
+            vae_model_path=get_latentsync_path("vae", "sd-vae-ft-mse"),
+            disable_deepcache=False,
+            deepcache_cache_interval=3,
+            deepcache_branch_id=0,
+        )
+
+        return cur_dir, inference_script_path, config, args
+
+    def _run_inference(
+        self,
+        video_path,
+        audio_path,
+        output_video_path,
+        seed,
+        lips_expression,
+        inference_steps,
+        segment_inferences,
+        temp_dir,
+        execution_settings,
+    ):
+        cur_dir, inference_script_path, config, args = self._build_inference_args(
+            video_path=video_path,
+            audio_path=audio_path,
+            output_video_path=output_video_path,
+            seed=seed,
+            lips_expression=lips_expression,
+            inference_steps=inference_steps,
+            segment_inferences=segment_inferences,
+            temp_dir=temp_dir,
+            execution_settings=execution_settings,
+        )
+
+        package_root = os.path.dirname(cur_dir)
+        if package_root not in sys.path:
+            sys.path.insert(0, package_root)
+        if cur_dir not in sys.path:
+            sys.path.insert(0, cur_dir)
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        inference_module = import_inference_script(inference_script_path)
+        if hasattr(inference_module, "get_temp_dir"):
+            setattr(inference_module, "get_temp_dir", lambda *args, **kwargs: temp_dir)
+
+        inference_temp = os.path.join(temp_dir, "temp")
+        os.makedirs(inference_temp, exist_ok=True)
+
+        # ComfyUI often wraps node execution in torch.inference_mode().
+        # The LatentSync stack and some third-party preprocessing ops are
+        # more reliable with normal tensors, so we explicitly disable it here.
+        with torch.inference_mode(False):
+            inference_module.main(config, args)
+
+    def _run_inference_with_optional_face_roi(
+        self,
+        video_path,
+        audio_path,
+        output_video_path,
+        seed,
+        lips_expression,
+        inference_steps,
+        segment_inferences,
+        temp_dir,
+        execution_settings,
+        face_roi_pre_crop="off",
+        roi_padding_ratio=0.35,
+        roi_sample_frames=12,
+    ):
+        pre_crop_mode = str(face_roi_pre_crop or "off").lower()
+        if pre_crop_mode not in {"off", "auto", "force"}:
+            raise ValueError(f"Pililink: unsupported face ROI pre-crop mode: {face_roi_pre_crop}")
+
+        if pre_crop_mode == "off":
+            self._run_inference(
+                video_path=video_path,
+                audio_path=audio_path,
+                output_video_path=output_video_path,
+                seed=seed,
+                lips_expression=lips_expression,
+                inference_steps=inference_steps,
+                segment_inferences=segment_inferences,
+                temp_dir=temp_dir,
+                execution_settings=execution_settings,
+            )
+            return
+
+        device = execution_settings["device"]
+        device_str = device.type if hasattr(device, "type") else str(device)
+        cropped_video_path = os.path.join(temp_dir, "pililink_face_roi_input.mp4")
+        face_result_path = os.path.join(temp_dir, "pililink_face_roi_output.mp4")
+
+        try:
+            print(f"Pililink: Running face ROI pre-crop mode ({pre_crop_mode})")
+            roi = detect_face_roi_for_video(
+                video_path,
+                device_str=device_str,
+                padding_ratio=roi_padding_ratio,
+                sample_frames=roi_sample_frames,
+            )
+            crop_video_to_face_roi(video_path, cropped_video_path, roi)
+            self._run_inference(
+                video_path=cropped_video_path,
+                audio_path=audio_path,
+                output_video_path=face_result_path,
+                seed=seed,
+                lips_expression=lips_expression,
+                inference_steps=inference_steps,
+                segment_inferences=segment_inferences,
+                temp_dir=temp_dir,
+                execution_settings=execution_settings,
+            )
+            merge_face_result_back(video_path, face_result_path, output_video_path, roi)
+        except Exception as exc:
+            if pre_crop_mode == "auto":
+                print(f"Pililink: Face ROI pre-crop fallback to full-frame inference due to: {exc}")
+                self._run_inference(
+                    video_path=video_path,
+                    audio_path=audio_path,
+                    output_video_path=output_video_path,
+                    seed=seed,
+                    lips_expression=lips_expression,
+                    inference_steps=inference_steps,
+                    segment_inferences=segment_inferences,
+                    temp_dir=temp_dir,
+                    execution_settings=execution_settings,
+                )
+                return
+            raise
+
+
+class PililinkLatentSyncNode(PililinkLatentSyncBase):
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -499,47 +1401,8 @@ class PililinkLatentSyncNode:
         
         log_timing("Starting Pililink inference")
         
-        # Get GPU capabilities and memory
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        use_mixed_precision = False
-        
-        # Set VRAM usage based on user preference
-        if torch.cuda.is_available():
-            gpu_mem = torch.cuda.get_device_properties(0).total_memory
-            gpu_mem_gb = gpu_mem / (1024 ** 3)
-            
-            # Dynamic batch size and settings based on VRAM usage preference
-            if vram_usage == "high":
-                batch_size = min(32, 120 // inference_steps)
-                use_mixed_precision = True
-                torch.backends.cudnn.benchmark = True
-                torch.backends.cuda.matmul.allow_tf32 = True if hasattr(torch.backends.cuda, "matmul") else False
-                torch.backends.cudnn.allow_tf32 = True
-                torch.cuda.set_per_process_memory_fraction(0.95)
-                print(f"Using Pililink high VRAM settings with {batch_size} batch size")
-            elif vram_usage == "medium":
-                batch_size = min(16, 80 // inference_steps)
-                use_mixed_precision = True
-                torch.backends.cudnn.benchmark = True
-                torch.cuda.set_per_process_memory_fraction(0.85)
-                print(f"Using Pililink medium VRAM settings with {batch_size} batch size")
-            else:  # low
-                batch_size = min(8, 40 // inference_steps)
-                use_mixed_precision = False
-                torch.cuda.set_per_process_memory_fraction(0.75)
-                print(f"Using Pililink low VRAM settings with {batch_size} batch size")
-                
-            # Clear GPU cache before processing
-            torch.cuda.empty_cache()
-        else:
-            # CPU fallback settings
-            batch_size = 4
-            print("No GPU detected, using CPU with minimal batch size")
-        
-        # Create a run-specific subdirectory in our temp directory
-        run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
-        temp_dir = os.path.join(MODULE_TEMP_DIR, f"pililink_run_{run_id}")
-        os.makedirs(temp_dir, exist_ok=True)
+        execution_settings = self._prepare_execution_settings(inference_steps, vram_usage)
+        run_id, temp_dir = self._create_run_temp_dir()
         
         temp_video_path = None
         output_video_path = None
@@ -551,9 +1414,6 @@ class PililinkLatentSyncNode:
             temp_video_path = os.path.join(temp_dir, f"pililink_temp_{run_id}.mp4")
             output_video_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_out.mp4")
             audio_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_audio.wav")
-            
-            # Get the extension directory
-            cur_dir = os.path.dirname(os.path.abspath(__file__))
             
             log_timing("Processing input frames")
             throw_if_processing_interrupted()
@@ -596,27 +1456,9 @@ class PililinkLatentSyncNode:
 
             log_timing("Processing audio")
             throw_if_processing_interrupted()
-            # Resample audio if needed
-            if sample_rate != 16000:
-                new_sample_rate = 16000
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate,
-                    new_freq=new_sample_rate
-                )
-                waveform_16k = resampler(waveform)
-                waveform, sample_rate = waveform_16k, new_sample_rate
-
-            # Package resampled audio
-            resampled_audio = {
-                "waveform": waveform.unsqueeze(0),
-                "sample_rate": sample_rate
-            }
-            
             log_timing("Saving temporary files")
             throw_if_processing_interrupted()
-            # Move waveform to CPU for saving
-            waveform_cpu = waveform.cpu()
-            torchaudio.save(audio_path, waveform_cpu, sample_rate)
+            resampled_audio = save_audio_input(audio, audio_path)
 
             # Move frames to CPU for saving to video
             frames_cpu = frames.cpu()
@@ -642,87 +1484,23 @@ class PililinkLatentSyncNode:
                 container.close()
             
             # Free up memory after saving
-            del frames_cpu, waveform_cpu
+            del frames_cpu
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            log_timing("Setting up model paths")
-            throw_if_processing_interrupted()
-            # Define paths to required files and configs from unified root
-            inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
-            config_path = os.path.join(cur_dir, "configs", "unet", "stage2.yaml")
-            scheduler_config_path = os.path.join(cur_dir, "configs")
-            ckpt_path = get_latentsync_path("latentsync_unet.pt")
-            whisper_ckpt_path = get_latentsync_path("whisper", "tiny.pt")
-
-            # Create config and args
-            config = OmegaConf.load(config_path)
-
-            # Set the correct mask image path
-            mask_image_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
-            # Make sure the mask image exists
-            if not os.path.exists(mask_image_path):
-                # Try to find it in the utils directory directly
-                alt_mask_path = os.path.join(cur_dir, "utils", "mask.png")
-                if os.path.exists(alt_mask_path):
-                    mask_image_path = alt_mask_path
-                else:
-                    print(f"Warning: Could not find mask image at expected locations")
-
-            # Set mask path in config
-            if hasattr(config, "data") and hasattr(config.data, "mask_image_path"):
-                config.data.mask_image_path = mask_image_path
-
-            args = argparse.Namespace(
-                unet_config_path=config_path,
-                inference_ckpt_path=ckpt_path,
-                video_path=temp_video_path,
-                audio_path=audio_path,
-                video_out_path=output_video_path,
-                seed=seed,
-                inference_steps=inference_steps,
-                guidance_scale=lips_expression,  # Using lips_expression for the guidance_scale
-                scheduler_config_path=scheduler_config_path,
-                whisper_ckpt_path=whisper_ckpt_path,
-                device=device,
-                batch_size=batch_size,
-                use_mixed_precision=use_mixed_precision,
-                temp_dir=temp_dir,
-                segment_inferences=segment_inferences,
-                mask_image_path=mask_image_path,
-                latentsync_root=LATENTSYNC_ROOT_DIR,
-                hf_cache_dir=HF_CACHE_DIR,
-                vae_model_path=get_latentsync_path("vae", "sd-vae-ft-mse")
-            )
-
-            # Set PYTHONPATH to include our directories 
-            package_root = os.path.dirname(cur_dir)
-            if package_root not in sys.path:
-                sys.path.insert(0, package_root)
-            if cur_dir not in sys.path:
-                sys.path.insert(0, cur_dir)
-
-            # Clean GPU cache before inference
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            log_timing("Importing inference module")
-            throw_if_processing_interrupted()
-            # Import the inference module
-            inference_module = import_inference_script(inference_script_path)
-            
-            # Monkey patch any temp directory functions in the inference module
-            if hasattr(inference_module, 'get_temp_dir'):
-                setattr(inference_module, 'get_temp_dir', lambda *args, **kwargs: temp_dir)
-                
-            # Create subdirectories that the inference module might expect
-            inference_temp = os.path.join(temp_dir, "temp")
-            os.makedirs(inference_temp, exist_ok=True)
-            
             log_timing("Running Pililink inference")
             throw_if_processing_interrupted()
-            # Run inference
-            inference_module.main(config, args)
+            self._run_inference(
+                video_path=temp_video_path,
+                audio_path=audio_path,
+                output_video_path=output_video_path,
+                seed=seed,
+                lips_expression=lips_expression,
+                inference_steps=inference_steps,
+                segment_inferences=segment_inferences,
+                temp_dir=temp_dir,
+                execution_settings=execution_settings,
+            )
 
             log_timing("Processing output")
             throw_if_processing_interrupted()
@@ -782,12 +1560,138 @@ class PililinkLatentSyncNode:
                             os.remove(path)
                         except:
                             pass
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
             except:
                 pass  # Ignore cleanup errors
 
             # Final GPU cache cleanup
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+
+class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_path": ("STRING", {"default": "", "multiline": False, "placeholder": "D:/videos/input.mp4"}),
+                "seed": ("INT", {"default": 1247}),
+                "lips_expression": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 3.0, "step": 0.1}),
+                "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
+                "vram_usage": (["high", "medium", "low"], {"default": "medium"}),
+                "segment_inferences": ("INT", {"default": 16, "min": 2, "max": 256, "step": 2}),
+                "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
+                "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 3.0, "step": 0.1}),
+                "face_roi_pre_crop": (["off", "auto", "force"], {"default": "off"}),
+                "roi_padding_ratio": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "roi_sample_frames": ("INT", {"default": 12, "min": 4, "max": 48, "step": 2}),
+                "filename_prefix": ("STRING", {"default": "LatentSync/Pililink"}),
+            },
+            "optional": {
+                "audio": ("AUDIO",),
+                "audio_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Leave empty to use audio input or the video's original audio"}),
+                "output_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional absolute output .mp4 path"}),
+            },
+        }
+
+    CATEGORY = NODE_CATEGORY
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("video_path", "filename")
+    FUNCTION = "inference_from_path"
+    OUTPUT_NODE = True
+
+    def inference_from_path(
+        self,
+        video_path,
+        seed,
+        lips_expression=1.5,
+        inference_steps=20,
+        vram_usage="medium",
+        segment_inferences=16,
+        mode="normal",
+        silent_padding_sec=0.5,
+        face_roi_pre_crop="off",
+        roi_padding_ratio=0.35,
+        roi_sample_frames=12,
+        filename_prefix="LatentSync/Pililink",
+        audio=None,
+        audio_path="",
+        output_path="",
+    ):
+        throw_if_processing_interrupted()
+        start_time = time.time()
+        resolved_video_path = resolve_user_path(video_path, "video_path")
+        execution_settings = self._prepare_execution_settings(inference_steps, vram_usage)
+        run_id, temp_dir = self._create_run_temp_dir()
+
+        temp_audio_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_audio.wav")
+        final_output_path, output_filename = get_output_video_path(filename_prefix, output_path)
+
+        try:
+            audio_path_text = str(audio_path or "").strip()
+            if audio_path_text:
+                resolved_audio_path = resolve_user_path(audio_path_text, "audio_path")
+            elif audio is not None:
+                save_audio_input(audio, temp_audio_path)
+                resolved_audio_path = temp_audio_path
+            else:
+                print("Pililink: No audio input provided, extracting audio track from source video")
+                resolved_audio_path = extract_audio_from_video(resolved_video_path, temp_audio_path)
+
+            aligned_video_path, aligned_audio_path = match_path_node_lengths(
+                resolved_video_path,
+                resolved_audio_path,
+                mode,
+                silent_padding_sec,
+                temp_dir,
+            )
+
+            print(f"Pililink: Processing source video path {resolved_video_path}")
+            print(f"Pililink: Saving output video to {final_output_path}")
+
+            self._run_inference_with_optional_face_roi(
+                video_path=aligned_video_path,
+                audio_path=aligned_audio_path,
+                output_video_path=final_output_path,
+                seed=seed,
+                lips_expression=lips_expression,
+                inference_steps=inference_steps,
+                segment_inferences=segment_inferences,
+                temp_dir=temp_dir,
+                execution_settings=execution_settings,
+                face_roi_pre_crop=face_roi_pre_crop,
+                roi_padding_ratio=roi_padding_ratio,
+                roi_sample_frames=roi_sample_frames,
+            )
+
+            total_time = time.time() - start_time
+            print(f"Pililink path-node total processing time: {total_time:.2f}s")
+            return {
+                "ui": {"text": [final_output_path]},
+                "result": (final_output_path, output_filename),
+            }
+        except RuntimeError as e:
+            if "Face not detected" in str(e) or "未检测到人脸" in str(e):
+                print(f"[Pililink] Face detection failed: {str(e)}")
+                raise RuntimeError(
+                    "未检测到人脸：输入视频中未能识别到人脸，请检查输入视频是否包含清晰的正面人脸。\n"
+                    "Face not detected: No face was found in the input video. "
+                    "Please ensure the video contains a clearly visible frontal face."
+                ) from e
+            print(f"Error during Pililink path inference: {str(e)}")
+            traceback.print_exc()
+            raise
+        except Exception as e:
+            print(f"Error during Pililink path inference: {str(e)}")
+            traceback.print_exc()
+            raise
+        finally:
+            try:
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 class PililinkVideoLengthAdjuster:
@@ -1001,11 +1905,13 @@ class PililinkVideoLengthAdjuster:
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
     NODE_KEY_MAIN: PililinkLatentSyncNode,
+    NODE_KEY_MAIN_PATH: PililinkLatentSyncVideoPathNode,
     NODE_KEY_ADJUSTER: PililinkVideoLengthAdjuster,
 }
 
 # Display Names for ComfyUI - Clear distinction from original
 NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_KEY_MAIN: NODE_DISPLAY_MAIN,
+    NODE_KEY_MAIN_PATH: NODE_DISPLAY_MAIN_PATH,
     NODE_KEY_ADJUSTER: NODE_DISPLAY_ADJUSTER,
 }

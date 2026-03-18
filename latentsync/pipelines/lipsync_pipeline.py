@@ -4,6 +4,7 @@ import inspect
 import os
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Union
 import subprocess
 
@@ -32,6 +33,8 @@ import cv2
 from ..models.unet import UNet3DConditionModel
 from ..utils.util import (
     check_ffmpeg_installed,
+    get_ffmpeg_video_encode_args,
+    get_preferred_ffmpeg_video_codec,
     get_video_frame_count,
     iter_video_cv2,
     prepare_video_for_processing,
@@ -53,6 +56,13 @@ except Exception:
 def throw_if_processing_interrupted():
     if comfy_model_management is not None:
         comfy_model_management.throw_exception_if_processing_interrupted()
+
+
+def wait_for_future_with_interrupt(future):
+    while not future.done():
+        throw_if_processing_interrupted()
+        time.sleep(0.1)
+    return future.result()
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -376,7 +386,8 @@ class LipsyncPipeline(DiffusionPipeline):
         batch_size = 1
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
-        self.image_processor = ImageProcessor(height, mask=mask, device="cuda", mask_image=mask_image)
+        image_processor_device = device.type if hasattr(device, "type") else str(device)
+        self.image_processor = ImageProcessor(height, mask=mask, device=image_processor_device, mask_image=mask_image)
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
         # 1. Default height and width to unet
@@ -398,14 +409,25 @@ class LipsyncPipeline(DiffusionPipeline):
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        whisper_feature = self.audio_encoder.audio2feat(audio_path)
-        whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
-        throw_if_processing_interrupted()
-
         stream_temp_dir = os.path.join(kwargs.get("temp_dir", "temp"), "stream")
         os.makedirs(stream_temp_dir, exist_ok=True)
 
-        normalized_video_path = prepare_video_for_processing(video_path, change_fps=True, temp_dir=stream_temp_dir)
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
+            whisper_feature_future = executor.submit(self.audio_encoder.audio2feat, audio_path)
+            normalized_video_future = executor.submit(
+                prepare_video_for_processing,
+                video_path,
+                True,
+                stream_temp_dir,
+            )
+            whisper_feature = wait_for_future_with_interrupt(whisper_feature_future)
+            normalized_video_path = wait_for_future_with_interrupt(normalized_video_future)
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+        throw_if_processing_interrupted()
         total_frames = get_video_frame_count(normalized_video_path)
         total_aligned_frames = (total_frames // num_frames) * num_frames
         total_inferences = min(total_aligned_frames // num_frames, len(whisper_chunks) // num_frames)
@@ -421,7 +443,11 @@ class LipsyncPipeline(DiffusionPipeline):
         segment_frames = max(num_frames, segment_inferences * num_frames)
 
         try:
-            for segment_video_frames in iter_video_cv2(normalized_video_path, segment_frames):
+            for segment_video_frames in iter_video_cv2(
+                normalized_video_path,
+                segment_frames,
+                interrupt_checker=throw_if_processing_interrupted,
+            ):
                 throw_if_processing_interrupted()
                 remaining_inferences = total_inferences - global_inference_index
                 if remaining_inferences <= 0:
@@ -553,24 +579,68 @@ class LipsyncPipeline(DiffusionPipeline):
             raise RuntimeError("No output frames produced during segmented inference")
 
         output_duration = processed_frame_count / max(video_fps, 1)
-        command = (
-            f"ffmpeg -y -loglevel error -nostdin -i \"{final_video_path}\" -i \"{audio_path}\" "
-            f"-t {output_duration:.6f} -c:v libx264 -c:a aac -q:v 0 -q:a 0 \"{video_out_path}\""
-        )
-        process = None
-        try:
-            throw_if_processing_interrupted()
-            process = subprocess.Popen(command, shell=True)
-            while process.poll() is None:
+        preferred_codec = get_preferred_ffmpeg_video_codec()
+        codecs_to_try = [preferred_codec]
+        if preferred_codec != "libx264":
+            codecs_to_try.append("libx264")
+
+        last_error = None
+        for codec in codecs_to_try:
+            command = [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-i",
+                final_video_path,
+                "-i",
+                audio_path,
+                "-t",
+                f"{output_duration:.6f}",
+                *get_ffmpeg_video_encode_args(codec),
+                "-c:a",
+                "aac",
+                video_out_path,
+            ]
+            process = None
+            try:
                 throw_if_processing_interrupted()
-                time.sleep(0.1)
-            if process.returncode != 0:
-                raise RuntimeError(f"ffmpeg failed with exit code {process.returncode}")
-        except Exception:
-            if process is not None and process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except Exception:
-                    process.kill()
-            raise
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                while process.poll() is None:
+                    throw_if_processing_interrupted()
+                    time.sleep(0.1)
+                stdout, stderr = process.communicate()
+                if process.returncode == 0:
+                    if codec != preferred_codec:
+                        print(f"[Pililink] ffmpeg video encoder fallback succeeded with {codec}")
+                    last_error = None
+                    break
+
+                stderr_message = (stderr or stdout or "").strip()
+                if stderr_message:
+                    last_error = RuntimeError(
+                        f"ffmpeg failed with exit code {process.returncode} using {codec}: {stderr_message}"
+                    )
+                else:
+                    last_error = RuntimeError(f"ffmpeg failed with exit code {process.returncode} using {codec}")
+                if codec != "libx264":
+                    print(f"[Pililink] ffmpeg video encoder {codec} failed, retrying with libx264")
+                    continue
+                raise last_error
+            except Exception:
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except Exception:
+                        process.kill()
+                raise
+
+        if last_error is not None:
+            raise last_error

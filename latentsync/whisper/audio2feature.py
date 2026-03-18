@@ -1,9 +1,11 @@
 # Adapted from https://github.com/TMElyralab/MuseTalk/blob/main/musetalk/whisper/audio2feature.py
 
 from .whisper import load_model
+import hashlib
 import numpy as np
 import torch
 import os
+from pathlib import Path
 
 
 class Audio2Feature:
@@ -17,6 +19,8 @@ class Audio2Feature:
     ):
         self.model = load_model(model_path, device)
         self.audio_embeds_cache_dir = audio_embeds_cache_dir
+        if audio_embeds_cache_dir is not None and audio_embeds_cache_dir != "":
+            Path(audio_embeds_cache_dir).mkdir(parents=True, exist_ok=True)
         self.num_frames = num_frames
         self.embedding_dim = self.model.dims.n_audio_state
         self.audio_feat_length = audio_feat_length
@@ -118,7 +122,13 @@ class Audio2Feature:
         if self.audio_embeds_cache_dir == "" or self.audio_embeds_cache_dir is None:
             return self._audio2feat(audio_path)
 
-        audio_embeds_cache_path = os.path.join(self.audio_embeds_cache_dir, os.path.basename(audio_path) + ".pt")
+        audio_path_abs = os.path.abspath(audio_path)
+        audio_name = Path(audio_path_abs).stem
+        cache_key = hashlib.sha1(audio_path_abs.encode("utf-8")).hexdigest()[:16]
+        audio_embeds_cache_path = os.path.join(
+            self.audio_embeds_cache_dir,
+            f"{audio_name}_{cache_key}.pt",
+        )
 
         if os.path.isfile(audio_embeds_cache_path):
             try:

@@ -22,6 +22,11 @@ from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 
+try:
+    from DeepCache import DeepCacheSDHelper
+except Exception:
+    DeepCacheSDHelper = None
+
 
 comfy_model_management = None
 try:
@@ -35,6 +40,41 @@ def throw_if_processing_interrupted():
         comfy_model_management.throw_exception_if_processing_interrupted()
 
 
+def maybe_enable_deepcache(pipeline, args, device_str):
+    disable_by_env = os.environ.get("PILILINK_DISABLE_DEEPCACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if getattr(args, "disable_deepcache", False) or disable_by_env:
+        print("DeepCache disabled for this run")
+        return None
+
+    if device_str != "cuda" or not torch.cuda.is_available():
+        print("DeepCache skipped: CUDA device not available")
+        return None
+
+    if DeepCacheSDHelper is None:
+        print("DeepCache not installed; continuing without it")
+        return None
+
+    cache_interval = max(1, int(getattr(args, "deepcache_cache_interval", 3)))
+    cache_branch_id = max(0, int(getattr(args, "deepcache_branch_id", 0)))
+
+    # DeepCache expects a standard `unet` attribute on the pipeline.
+    if not hasattr(pipeline, "unet"):
+        setattr(pipeline, "unet", pipeline.denoising_unet)
+
+    try:
+        helper = DeepCacheSDHelper(pipe=pipeline)
+        helper.set_params(cache_interval=cache_interval, cache_branch_id=cache_branch_id)
+        helper.enable()
+        print(
+            f"DeepCache enabled (cache_interval={cache_interval}, "
+            f"cache_branch_id={cache_branch_id})"
+        )
+        return helper
+    except Exception as exc:
+        print(f"DeepCache initialization failed, continuing without it: {exc}")
+        return None
+
+
 def main(config, args):
     throw_if_processing_interrupted()
     if not os.path.exists(args.video_path):
@@ -42,8 +82,11 @@ def main(config, args):
     if not os.path.exists(args.audio_path):
         raise RuntimeError(f"Audio path '{args.audio_path}' not found")
 
+    device = getattr(args, "device", "cuda")
+    device_str = device.type if hasattr(device, "type") else str(device)
+
     # Check if the GPU supports float16
-    is_fp16_supported = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
+    is_fp16_supported = device_str == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
     dtype = torch.float16 if is_fp16_supported else torch.float32
 
     print(f"Input video path: {args.video_path}")
@@ -120,16 +163,21 @@ def main(config, args):
 
     audio_encoder = Audio2Feature(
         model_path=whisper_model_path,
-        device="cuda",
+        device=device_str,
+        audio_embeds_cache_dir=getattr(args, "audio_embeds_cache_dir", None),
         num_frames=config.data.num_frames,
         audio_feat_length=config.data.audio_feat_length,
     )
+    audio_encoder.model.requires_grad_(False)
+    audio_encoder.model.eval()
     throw_if_processing_interrupted()
 
     vae_model_path = getattr(args, "vae_model_path", "stabilityai/sd-vae-ft-mse")
     vae = AutoencoderKL.from_pretrained(vae_model_path, torch_dtype=dtype)
     vae.config.scaling_factor = 0.18215
     vae.config.shift_factor = 0
+    vae.requires_grad_(False)
+    vae.eval()
 
     denoising_unet, _ = UNet3DConditionModel.from_pretrained(
         OmegaConf.to_container(config.model),
@@ -138,6 +186,8 @@ def main(config, args):
     )
 
     denoising_unet = denoising_unet.to(dtype=dtype)
+    denoising_unet.requires_grad_(False)
+    denoising_unet.eval()
     throw_if_processing_interrupted()
 
     pipeline = LipsyncPipeline(
@@ -145,7 +195,10 @@ def main(config, args):
         audio_encoder=audio_encoder,
         denoising_unet=denoising_unet,
         scheduler=scheduler,
-    ).to("cuda")
+    ).to(device_str)
+    throw_if_processing_interrupted()
+
+    deepcache_helper = maybe_enable_deepcache(pipeline, args, device_str)
     throw_if_processing_interrupted()
 
     if args.seed != -1:
@@ -155,21 +208,29 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
-    pipeline(
-        video_path=args.video_path,
-        audio_path=args.audio_path,
-        video_out_path=args.video_out_path,
-        video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
-        num_frames=config.data.num_frames,
-        num_inference_steps=args.inference_steps,
-        guidance_scale=args.guidance_scale,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-        segment_inferences=getattr(args, "segment_inferences", 48),
-        temp_dir=getattr(args, "temp_dir", "temp"),
-        mask_image_path=config.data.mask_image_path,
-    )
+    try:
+        pipeline(
+            video_path=args.video_path,
+            audio_path=args.audio_path,
+            video_out_path=args.video_out_path,
+            video_mask_path=args.video_out_path.replace(".mp4", "_mask.mp4"),
+            num_frames=config.data.num_frames,
+            num_inference_steps=args.inference_steps,
+            guidance_scale=args.guidance_scale,
+            weight_dtype=dtype,
+            width=config.data.resolution,
+            height=config.data.resolution,
+            segment_inferences=getattr(args, "segment_inferences", 48),
+            temp_dir=getattr(args, "temp_dir", "temp"),
+            mask_image_path=config.data.mask_image_path,
+        )
+    finally:
+        if deepcache_helper is not None and hasattr(deepcache_helper, "disable"):
+            try:
+                deepcache_helper.disable()
+                print("DeepCache disabled after inference")
+            except Exception as exc:
+                print(f"DeepCache cleanup warning: {exc}")
 
 
 if __name__ == "__main__":
@@ -182,6 +243,9 @@ if __name__ == "__main__":
     parser.add_argument("--inference_steps", type=int, default=20)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=1247)
+    parser.add_argument("--disable_deepcache", action="store_true")
+    parser.add_argument("--deepcache_cache_interval", type=int, default=3)
+    parser.add_argument("--deepcache_branch_id", type=int, default=0)
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)
