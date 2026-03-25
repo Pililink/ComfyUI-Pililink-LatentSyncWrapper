@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd \"E:\\\\comfyui-custom_nodes\\\\ComfyUI-Pililink-LatentSyncWrapper\" && python -c \"import ast; ast.parse\\(open\\('nodes.py'\\).read\\(\\)\\); print\\('nodes.py: OK'\\)\" && python -c \"import ast; ast.parse\\(open\\('latentsync/pipelines/lipsync_pipeline.py'\\).read\\(\\)\\); print\\('lipsync_pipeline.py: OK'\\)\")"
+    ]
+  }
+}

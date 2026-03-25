@@ -1,0 +1,234 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1773417413740,
+  "projectRoot": "E:\\comfyui-custom_nodes\\ComfyUI-Pililink-LatentSyncWrapper",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "scripts"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "configs": {
+      "path": "configs",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1773417413718,
+      "keyFiles": [
+        "audio.yaml"
+      ]
+    },
+    "eval": {
+      "path": "eval",
+      "purpose": null,
+      "fileCount": 10,
+      "lastAccessed": 1773417413719,
+      "keyFiles": [
+        "draw_syncnet_lines.py",
+        "eval_fvd.py",
+        "eval_syncnet_acc.py",
+        "eval_syncnet_acc.sh",
+        "eval_sync_conf.py"
+      ]
+    },
+    "latentsync": {
+      "path": "latentsync",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1773417413720,
+      "keyFiles": []
+    },
+    "preprocess": {
+      "path": "preprocess",
+      "purpose": null,
+      "fileCount": 10,
+      "lastAccessed": 1773417413720,
+      "keyFiles": [
+        "affine_transform.py",
+        "data_processing_pipeline.py",
+        "detect_shot.py",
+        "filter_high_resolution.py",
+        "filter_visual_quality.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 3,
+      "lastAccessed": 1773417413721,
+      "keyFiles": [
+        "inference.py",
+        "train_syncnet.py",
+        "train_unet.py"
+      ]
+    },
+    "tools": {
+      "path": "tools",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1773417413721,
+      "keyFiles": [
+        "count_total_videos_time.py",
+        "count_videos_time.py",
+        "download_web_videos.py",
+        "download_youtube_videos.py",
+        "move_files_recur.py"
+      ]
+    },
+    "workflows": {
+      "path": "workflows",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1773417413721,
+      "keyFiles": [
+        "Video_int_LipSync.json"
+      ]
+    },
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1773417413722,
+      "keyFiles": [
+        "latentsync_paths.cpython-311.pyc",
+        "nodes.cpython-311.pyc",
+        "__init__.cpython-311.pyc"
+      ]
+    },
+    "latentsync\\data": {
+      "path": "latentsync\\data",
+      "purpose": "Data files",
+      "fileCount": 2,
+      "lastAccessed": 1773417413723,
+      "keyFiles": [
+        "syncnet_dataset.py",
+        "unet_dataset.py"
+      ]
+    },
+    "latentsync\\models": {
+      "path": "latentsync\\models",
+      "purpose": "Data models",
+      "fileCount": 8,
+      "lastAccessed": 1773417413723,
+      "keyFiles": [
+        "attention.py",
+        "motion_module.py",
+        "resnet.py"
+      ]
+    },
+    "latentsync\\utils": {
+      "path": "latentsync\\utils",
+      "purpose": "Utility functions",
+      "fileCount": 9,
+      "lastAccessed": 1773417413723,
+      "keyFiles": [
+        "affine_transform.py",
+        "audio.py",
+        "av_reader.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "nodes.py",
+      "accessCount": 4,
+      "lastAccessed": 1773417678326,
+      "type": "file"
+    },
+    {
+      "path": "latentsync\\pipelines\\lipsync_pipeline.py",
+      "accessCount": 3,
+      "lastAccessed": 1773417678262,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1773417429866,
+      "type": "file"
+    },
+    {
+      "path": "__init__.py",
+      "accessCount": 1,
+      "lastAccessed": 1773417429880,
+      "type": "file"
+    },
+    {
+      "path": "requirements.txt",
+      "accessCount": 1,
+      "lastAccessed": 1773417447277,
+      "type": "file"
+    },
+    {
+      "path": "latentsync_paths.py",
+      "accessCount": 1,
+      "lastAccessed": 1773417447388,
+      "type": "file"
+    },
+    {
+      "path": "configs\\unet\\stage2.yaml",
+      "accessCount": 1,
+      "lastAccessed": 1773417461786,
+      "type": "file"
+    },
+    {
+      "path": "scripts\\inference.py",
+      "accessCount": 1,
+      "lastAccessed": 1773417461870,
+      "type": "file"
+    },
+    {
+      "path": "CLAUDE.md",
+      "accessCount": 1,
+      "lastAccessed": 1773417505809,
+      "type": "file"
+    },
+    {
+      "path": "latentsync\\utils\\image_processor.py",
+      "accessCount": 1,
+      "lastAccessed": 1773417561504,
+      "type": "file"
+    },
+    {
+      "path": "latentsync\\utils\\affine_transform.py",
+      "accessCount": 1,
+      "lastAccessed": 1773417561571,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
