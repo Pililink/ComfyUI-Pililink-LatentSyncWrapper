@@ -17,9 +17,11 @@ import cv2
 from einops import rearrange
 import mediapipe as mp
 import torch
+import torch.nn.functional as F
 import numpy as np
+import os
 from typing import Union
-from .affine_transform import AlignRestore, laplacianSmooth
+from .affine_transform import AlignRestore, laplacianSmooth, transformation_from_points
 import face_alignment
 
 """
@@ -39,6 +41,11 @@ def load_fixed_mask(resolution: int, mask_image_path="latentsync/utils/mask.png"
 class ImageProcessor:
     def __init__(self, resolution: int = 512, mask: str = "fix_mask", device: str = "cpu", mask_image=None):
         self.resolution = resolution
+        self.device_str = "cuda" if str(device).lower() != "cpu" and torch.cuda.is_available() else "cpu"
+        self.torch_device = torch.device(self.device_str)
+        self.use_gpu_affine = self.device_str == "cuda"
+        self.max_detection_size = max(256, int(os.environ.get("PILILINK_FACE_DETECT_MAX_SIZE", "960")))
+        self._output_coord_cache = {}
         self.resize = transforms.Resize(
             (resolution, resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True
         )
@@ -57,15 +64,131 @@ class ImageProcessor:
             else:
                 self.mask_image = mask_image
 
-            if device != "cpu":
+            if self.device_str != "cpu":
                 self.fa = face_alignment.FaceAlignment(
-                    face_alignment.LandmarksType.TWO_D, flip_input=False, device=device
+                    face_alignment.LandmarksType.TWO_D, flip_input=False, device=self.device_str
                 )
                 self.face_mesh = None
             else:
                 # self.face_mesh = mp.solutions.face_mesh.FaceMesh(static_image_mode=True)  # Process single image
                 self.face_mesh = None
                 self.fa = None
+
+    def _get_warp_target_coords(self, out_h: int, out_w: int):
+        cache_key = (out_h, out_w, str(self.torch_device))
+        cached = self._output_coord_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        ys = torch.arange(out_h, dtype=torch.float32, device=self.torch_device)
+        xs = torch.arange(out_w, dtype=torch.float32, device=self.torch_device)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        ones = torch.ones_like(xx)
+        coords = torch.stack([xx, yy, ones], dim=-1).reshape(-1, 3).transpose(0, 1).contiguous()
+        self._output_coord_cache[cache_key] = coords
+        return coords
+
+    def _detect_landmarks(self, image: np.ndarray, allow_multi_faces: bool = True):
+        if self.fa is None:
+            landmark_coordinates = np.array(self.detect_facial_landmarks(image))
+            return mediapipe_lm478_to_face_alignment_lm68(landmark_coordinates)
+
+        detect_image = image
+        detect_scale = 1.0
+        height, width = image.shape[:2]
+        max_dim = max(height, width)
+        if self.max_detection_size > 0 and max_dim > self.max_detection_size:
+            detect_scale = self.max_detection_size / float(max_dim)
+            detect_image = cv2.resize(
+                image,
+                (
+                    max(2, int(round(width * detect_scale))),
+                    max(2, int(round(height * detect_scale))),
+                ),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        detected_faces = self.fa.get_landmarks(detect_image)
+        if detected_faces is None:
+            raise RuntimeError("Face not detected")
+        if not allow_multi_faces and len(detected_faces) > 1:
+            raise RuntimeError("More than one face detected")
+
+        lm68 = np.asarray(detected_faces[0], dtype=np.float32)
+        if detect_scale != 1.0:
+            lm68 = lm68 / detect_scale
+        return lm68
+
+    def _warp_face_cpu(self, image: np.ndarray, affine_matrix: np.ndarray):
+        face = cv2.warpAffine(
+            image,
+            affine_matrix,
+            self.restorer.face_size,
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=[127, 127, 127],
+        )
+        if face.shape[0] != self.resolution or face.shape[1] != self.resolution:
+            face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
+        face = rearrange(torch.from_numpy(np.ascontiguousarray(face)), "h w c -> c h w")
+        return face
+
+    def _warp_face_gpu(self, image: np.ndarray, affine_matrix: np.ndarray):
+        out_w, out_h = self.restorer.face_size
+        image_tensor = (
+            torch.from_numpy(np.ascontiguousarray(image))
+            .to(device=self.torch_device, dtype=torch.float32)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+        )
+        src_h, src_w = image.shape[:2]
+        coords = self._get_warp_target_coords(out_h, out_w)
+
+        affine = torch.tensor(affine_matrix, device=self.torch_device, dtype=torch.float32)
+        affine3 = torch.eye(3, device=self.torch_device, dtype=torch.float32)
+        affine3[:2, :] = affine
+        inv_affine = torch.linalg.inv(affine3)[:2, :]
+        src_coords = inv_affine @ coords
+        src_x = src_coords[0].reshape(out_h, out_w)
+        src_y = src_coords[1].reshape(out_h, out_w)
+
+        if src_w > 1:
+            grid_x = (src_x / (src_w - 1.0)) * 2.0 - 1.0
+        else:
+            grid_x = torch.zeros_like(src_x)
+        if src_h > 1:
+            grid_y = (src_y / (src_h - 1.0)) * 2.0 - 1.0
+        else:
+            grid_y = torch.zeros_like(src_y)
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+
+        centered = image_tensor - 127.0
+        sampled = F.grid_sample(
+            centered,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        ) + 127.0
+
+        if out_h != self.resolution or out_w != self.resolution:
+            sampled = F.interpolate(
+                sampled,
+                size=(self.resolution, self.resolution),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        face = sampled.squeeze(0).clamp(0.0, 255.0).round().to(torch.uint8).cpu()
+        return face
+
+    def warp_face_with_affine_matrix(self, image: np.ndarray, affine_matrix: np.ndarray):
+        if self.use_gpu_affine:
+            face = self._warp_face_gpu(image, affine_matrix)
+        else:
+            face = self._warp_face_cpu(image, affine_matrix)
+        box = [0, 0, int(self.restorer.face_size[0]), int(self.restorer.face_size[1])]
+        return face, box
 
     def detect_facial_landmarks(self, image: np.ndarray):
         height, width, _ = image.shape
@@ -116,30 +239,20 @@ class ImageProcessor:
         return pixel_values, masked_pixel_values, mask
 
     def affine_transform(self, image: torch.Tensor, allow_multi_faces: bool = True) -> np.ndarray:
-        # image = rearrange(image, "c h w-> h w c").numpy()
-        if self.fa is None:
-            landmark_coordinates = np.array(self.detect_facial_landmarks(image))
-            lm68 = mediapipe_lm478_to_face_alignment_lm68(landmark_coordinates)
-        else:
-            detected_faces = self.fa.get_landmarks(image)
-            if detected_faces is None:
-                raise RuntimeError("Face not detected")
-            if not allow_multi_faces and len(detected_faces) > 1:
-                raise RuntimeError("More than one face detected")
-            lm68 = detected_faces[0]
+        lm68 = self._detect_landmarks(image, allow_multi_faces=allow_multi_faces)
 
         points = self.smoother.smooth(lm68)
         lmk3_ = np.zeros((3, 2))
         lmk3_[0] = points[17:22].mean(0)
         lmk3_[1] = points[22:27].mean(0)
         lmk3_[2] = points[27:36].mean(0)
-        # print(lmk3_)
-        face, affine_matrix = self.restorer.align_warp_face(
-            image.copy(), lmks3=lmk3_, smooth=True, border_mode="constant"
+        affine_matrix, self.restorer.p_bias = transformation_from_points(
+            lmk3_,
+            self.restorer.face_template,
+            smooth=True,
+            p_bias=self.restorer.p_bias,
         )
-        box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2
-        face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
-        face = rearrange(torch.from_numpy(face), "h w c -> c h w")
+        face, box = self.warp_face_with_affine_matrix(image, affine_matrix)
         return face, box, affine_matrix
 
     def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False):

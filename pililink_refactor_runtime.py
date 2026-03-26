@@ -207,6 +207,7 @@ class _RefactorRuntime:
         auto_oom_fallback,
         quality_mode,
         segment_overlap_clips,
+        affine_detect_interval,
     ):
         with self.run_lock:
             throw_if_processing_interrupted()
@@ -236,6 +237,7 @@ class _RefactorRuntime:
                 f"dtype={self.dtype}",
                 f"quality_mode={resolved_quality_mode}",
                 f"clip_batch_candidates={clip_batch_candidates}",
+                f"affine_detect_interval={max(1, int(affine_detect_interval))}",
             )
 
             previous_cudnn_benchmark = None
@@ -284,6 +286,7 @@ class _RefactorRuntime:
                                 ),
                                 clip_batch_size=current_clip_batch_size,
                                 segment_overlap_clips=max(0, int(segment_overlap_clips)),
+                                affine_detect_interval=max(1, int(affine_detect_interval)),
                             )
                         return
                     except Exception as exc:
@@ -341,6 +344,7 @@ def run_refactor_inference(
     auto_oom_fallback,
     quality_mode,
     segment_overlap_clips,
+    affine_detect_interval,
 ):
     throw_if_processing_interrupted()
 
@@ -397,4 +401,5 @@ def run_refactor_inference(
         auto_oom_fallback=auto_oom_fallback,
         quality_mode=quality_mode,
         segment_overlap_clips=segment_overlap_clips,
+        affine_detect_interval=affine_detect_interval,
     )

@@ -1308,6 +1308,7 @@ class PililinkLatentSyncBase:
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
     ):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
@@ -1355,6 +1356,7 @@ class PililinkLatentSyncBase:
             deepcache_branch_id=max(0, int(deepcache_branch_id)),
             scheduler_type=str(scheduler_type or "ddim").lower(),
             segment_overlap_clips=max(0, int(segment_overlap_clips)),
+            affine_detect_interval=max(1, int(affine_detect_interval)),
         )
 
         return cur_dir, inference_script_path, config, args
@@ -1375,6 +1377,7 @@ class PililinkLatentSyncBase:
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
     ):
         cur_dir, inference_script_path, config, args = self._build_inference_args(
             video_path=video_path,
@@ -1391,6 +1394,7 @@ class PililinkLatentSyncBase:
             deepcache_branch_id=deepcache_branch_id,
             scheduler_type=scheduler_type,
             segment_overlap_clips=segment_overlap_clips,
+            affine_detect_interval=affine_detect_interval,
         )
 
         package_root = os.path.dirname(cur_dir)
@@ -1434,6 +1438,7 @@ class PililinkLatentSyncBase:
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
     ):
         pre_crop_mode = str(face_roi_pre_crop or "off").lower()
         if pre_crop_mode not in {"off", "auto", "force"}:
@@ -1455,6 +1460,7 @@ class PililinkLatentSyncBase:
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
+                affine_detect_interval=affine_detect_interval,
             )
             return
 
@@ -1487,6 +1493,7 @@ class PililinkLatentSyncBase:
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
+                affine_detect_interval=affine_detect_interval,
             )
             merge_face_result_back(video_path, face_result_path, output_video_path, roi)
         except Exception as exc:
@@ -1507,6 +1514,7 @@ class PililinkLatentSyncBase:
                     deepcache_branch_id=deepcache_branch_id,
                     scheduler_type=scheduler_type,
                     segment_overlap_clips=segment_overlap_clips,
+                    affine_detect_interval=affine_detect_interval,
                 )
                 return
             raise
@@ -1529,6 +1537,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 "deepcache_branch_id": ("INT", {"default": 0, "min": 0, "max": 4, "step": 1}),
                 "scheduler_type": (["ddim", "dpm_solver"], {"default": "ddim"}),
                 "segment_overlap_clips": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1}),
+                "affine_detect_interval": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
                  },}
 
     CATEGORY = NODE_CATEGORY
@@ -1562,6 +1571,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
     ):
         throw_if_processing_interrupted()
         # Add timing information
@@ -1680,6 +1690,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
+                affine_detect_interval=affine_detect_interval,
             )
 
             log_timing("Processing output")
@@ -1763,6 +1774,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 "deepcache_branch_id": ("INT", {"default": 0, "min": 0, "max": 4, "step": 1}),
                 "scheduler_type": (["ddim", "dpm_solver"], {"default": "ddim"}),
                 "segment_overlap_clips": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1}),
+                "affine_detect_interval": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 3.0, "step": 0.1}),
                 "auto_silent_padding": ("BOOLEAN", {"default": False}),
@@ -1798,6 +1810,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
         mode="normal",
         silent_padding_sec=0.5,
         auto_silent_padding=False,
@@ -1869,6 +1882,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
+                affine_detect_interval=affine_detect_interval,
             )
 
             total_time = time.time() - start_time
@@ -2131,6 +2145,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
                 "quality_mode": "balanced",
                 "scheduler_type": "ddim",
                 "segment_overlap_clips": 0,
+                "affine_detect_interval": 1,
             }
         return {
             "clip_batch_size": max(1, int(options.get("clip_batch_size", 1))),
@@ -2138,6 +2153,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
             "quality_mode": str(options.get("quality_mode", "balanced")).lower(),
             "scheduler_type": str(options.get("scheduler_type", "ddim")).lower(),
             "segment_overlap_clips": max(0, int(options.get("segment_overlap_clips", 0))),
+            "affine_detect_interval": max(1, int(options.get("affine_detect_interval", 1))),
         }
 
     def _prepare_execution_settings(self, inference_steps, vram_usage):
@@ -2212,6 +2228,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
     ):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         package_root = os.path.dirname(cur_dir)
@@ -2238,6 +2255,14 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
                 segment_overlap_clips
                 if segment_overlap_clips is not None
                 else runtime_options.get("segment_overlap_clips", 0)
+            ),
+        )
+        resolved_affine_detect_interval = max(
+            1,
+            int(
+                affine_detect_interval
+                if affine_detect_interval is not None
+                else runtime_options.get("affine_detect_interval", 1)
             ),
         )
 
@@ -2268,6 +2293,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
             auto_oom_fallback=runtime_options["auto_oom_fallback"],
             quality_mode=runtime_options["quality_mode"],
             segment_overlap_clips=resolved_segment_overlap_clips,
+            affine_detect_interval=resolved_affine_detect_interval,
         )
 
 
@@ -2294,6 +2320,7 @@ class PililinkLatentSyncRefactorNode(PililinkLatentSyncRefactorMixin, PililinkLa
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
         clip_batch_size=1,
         auto_oom_fallback=True,
         quality_mode="balanced",
@@ -2304,6 +2331,7 @@ class PililinkLatentSyncRefactorNode(PililinkLatentSyncRefactorMixin, PililinkLa
             "quality_mode": quality_mode,
             "scheduler_type": scheduler_type,
             "segment_overlap_clips": segment_overlap_clips,
+            "affine_detect_interval": affine_detect_interval,
         }
         try:
             return super().inference(
@@ -2319,6 +2347,7 @@ class PililinkLatentSyncRefactorNode(PililinkLatentSyncRefactorMixin, PililinkLa
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
+                affine_detect_interval=affine_detect_interval,
             )
         finally:
             self._pililink_refactor_runtime_options = None
@@ -2349,6 +2378,7 @@ class PililinkLatentSyncRefactorVideoPathNode(
         deepcache_branch_id=0,
         scheduler_type="ddim",
         segment_overlap_clips=0,
+        affine_detect_interval=1,
         mode="normal",
         silent_padding_sec=0.5,
         auto_silent_padding=False,
@@ -2370,6 +2400,7 @@ class PililinkLatentSyncRefactorVideoPathNode(
             "quality_mode": quality_mode,
             "scheduler_type": scheduler_type,
             "segment_overlap_clips": segment_overlap_clips,
+            "affine_detect_interval": affine_detect_interval,
         }
         try:
             return super().inference_from_path(
@@ -2384,6 +2415,7 @@ class PililinkLatentSyncRefactorVideoPathNode(
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
+                affine_detect_interval=affine_detect_interval,
                 mode=mode,
                 silent_padding_sec=silent_padding_sec,
                 auto_silent_padding=auto_silent_padding,

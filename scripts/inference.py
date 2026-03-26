@@ -249,6 +249,7 @@ def main(config, args):
             height=config.data.resolution,
             segment_inferences=getattr(args, "segment_inferences", 48),
             segment_overlap_clips=max(0, int(getattr(args, "segment_overlap_clips", 0))),
+            affine_detect_interval=max(1, int(getattr(args, "affine_detect_interval", 1))),
             temp_dir=getattr(args, "temp_dir", "temp"),
             mask_image_path=config.data.mask_image_path,
         )
@@ -276,6 +277,7 @@ if __name__ == "__main__":
     parser.add_argument("--deepcache_branch_id", type=int, default=0)
     parser.add_argument("--scheduler_type", type=str, default="ddim")
     parser.add_argument("--segment_overlap_clips", type=int, default=0)
+    parser.add_argument("--affine_detect_interval", type=int, default=1)
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)

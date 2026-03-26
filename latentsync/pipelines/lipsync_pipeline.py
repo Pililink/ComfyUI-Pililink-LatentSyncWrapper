@@ -319,7 +319,8 @@ class LipsyncPipeline(DiffusionPipeline):
         blended = previous * (1.0 - alpha) + current * alpha
         return np.clip(blended, 0.0, 255.0).astype(np.uint8)
 
-    def affine_transform_video(self, video_frames: np.ndarray):
+    def affine_transform_video(self, video_frames: np.ndarray, affine_detect_interval: int = 1):
+        affine_detect_interval = max(1, int(affine_detect_interval))
         faces = []
         boxes = []
         affine_matrices = []
@@ -327,24 +328,48 @@ class LipsyncPipeline(DiffusionPipeline):
         last_good_box = None
         last_good_affine_matrix = None
         failed_indices = []
+        reused_indices = []
         print(f"Affine transforming {len(video_frames)} faces...")
         for idx, frame in enumerate(tqdm.tqdm(video_frames)):
             throw_if_processing_interrupted()
+            should_detect = last_good_affine_matrix is None or (idx % affine_detect_interval == 0)
+
+            if not should_detect:
+                try:
+                    reused_face, reused_box = self.image_processor.warp_face_with_affine_matrix(
+                        frame, last_good_affine_matrix
+                    )
+                    faces.append(reused_face)
+                    boxes.append(reused_box)
+                    affine_matrices.append(last_good_affine_matrix.copy())
+                    last_good_face = reused_face
+                    last_good_box = reused_box
+                    reused_indices.append(idx)
+                    continue
+                except Exception:
+                    should_detect = True
+
             try:
                 face, box, affine_matrix = self.image_processor.affine_transform(frame)
                 last_good_face = face
                 last_good_box = box
-                last_good_affine_matrix = affine_matrix
+                last_good_affine_matrix = affine_matrix.copy()
                 faces.append(face)
                 boxes.append(box)
-                affine_matrices.append(affine_matrix)
+                affine_matrices.append(last_good_affine_matrix)
             except RuntimeError as e:
                 if "Face not detected" in str(e):
                     failed_indices.append(idx)
-                    if last_good_face is not None:
-                        faces.append(last_good_face)
-                        boxes.append(last_good_box)
-                        affine_matrices.append(last_good_affine_matrix)
+                    if last_good_affine_matrix is not None:
+                        fallback_face, fallback_box = self.image_processor.warp_face_with_affine_matrix(
+                            frame, last_good_affine_matrix
+                        )
+                        faces.append(fallback_face)
+                        boxes.append(fallback_box)
+                        affine_matrices.append(last_good_affine_matrix.copy())
+                        last_good_face = fallback_face
+                        last_good_box = fallback_box
+                        reused_indices.append(idx)
                     else:
                         faces.append(None)
                         boxes.append(None)
@@ -354,6 +379,11 @@ class LipsyncPipeline(DiffusionPipeline):
 
         if failed_indices:
             print(f"[Pililink] Warning: Face not detected in {len(failed_indices)}/{len(video_frames)} frames")
+        if reused_indices:
+            print(
+                f"[Pililink] Reused affine matrix for {len(reused_indices)}/{len(video_frames)} frames "
+                f"(interval={affine_detect_interval})"
+            )
 
         # If no face was ever detected, raise a clear error
         if last_good_face is None:
@@ -442,17 +472,14 @@ class LipsyncPipeline(DiffusionPipeline):
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
-        # 3. set timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
-
-        # 4. Prepare extra step kwargs.
+        # 3. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         stream_temp_dir = os.path.join(kwargs.get("temp_dir", "temp"), "stream")
         os.makedirs(stream_temp_dir, exist_ok=True)
         skip_video_normalization = bool(kwargs.get("skip_video_normalization", False))
         clear_cuda_cache_per_segment = bool(kwargs.get("clear_cuda_cache_per_segment", True))
+        affine_detect_interval = max(1, int(kwargs.get("affine_detect_interval", 1)))
 
         executor = ThreadPoolExecutor(max_workers=2)
         try:
@@ -525,7 +552,9 @@ class LipsyncPipeline(DiffusionPipeline):
                 )
 
                 segment_video_frames = segment_video_frames[: segment_inference_count * num_frames]
-                faces, boxes, affine_matrices = self.affine_transform_video(segment_video_frames)
+                faces, boxes, affine_matrices = self.affine_transform_video(
+                    segment_video_frames, affine_detect_interval=affine_detect_interval
+                )
 
                 num_channels_latents = self.vae.config.latent_channels
 
@@ -611,6 +640,9 @@ class LipsyncPipeline(DiffusionPipeline):
                     ref_pixel_values_flat = rearrange(ref_pixel_values, "b f c h w -> (b f) c h w")
                     masks_flat = rearrange(masks, "b f c h w -> (b f) c h w")
 
+                    # DPM-Solver schedulers keep internal step state; reset before each batch trajectory.
+                    self.scheduler.set_timesteps(num_inference_steps, device=device)
+                    timesteps = self.scheduler.timesteps
                     num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
                     with self.progress_bar(total=num_inference_steps) as progress_bar:
                         for j, t in enumerate(timesteps):
