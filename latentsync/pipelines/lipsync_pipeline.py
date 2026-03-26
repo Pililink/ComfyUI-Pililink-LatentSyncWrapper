@@ -1,6 +1,7 @@
 # Adapted from https://github.com/guoyww/AnimateDiff/blob/main/animatediff/pipelines/pipeline_animation.py
 
 import inspect
+import math
 import os
 import shutil
 import time
@@ -472,6 +473,17 @@ class LipsyncPipeline(DiffusionPipeline):
 
         segment_frames = max(num_frames, segment_inferences * num_frames)
         clip_batch_size = max(1, int(kwargs.get("clip_batch_size", 1)))
+        total_output_frames = total_inferences * num_frames
+        total_segments = max(1, int(math.ceil(total_inferences / max(1, int(segment_inferences)))))
+        processed_segments = 0
+        pipeline_start_time = time.time()
+        print(
+            "Pililink progress init:",
+            f"total_clips={total_inferences}",
+            f"total_frames={total_output_frames}",
+            f"segment_inferences={segment_inferences}",
+            f"clip_batch_size={clip_batch_size}",
+        )
 
         try:
             for segment_video_frames in iter_video_cv2(
@@ -488,6 +500,13 @@ class LipsyncPipeline(DiffusionPipeline):
                 segment_inference_count = min(segment_frames_aligned // num_frames, remaining_inferences)
                 if segment_inference_count <= 0:
                     continue
+
+                processed_segments += 1
+                print(
+                    f"[Pililink] Segment {processed_segments}/{total_segments} start | "
+                    f"clips {global_inference_index}/{total_inferences} | "
+                    f"frames {processed_frame_count}/{total_output_frames}"
+                )
 
                 segment_video_frames = segment_video_frames[: segment_inference_count * num_frames]
                 faces, boxes, affine_matrices = self.affine_transform_video(segment_video_frames)
@@ -626,6 +645,16 @@ class LipsyncPipeline(DiffusionPipeline):
 
                 processed_frame_count += restored_segment.shape[0]
                 global_inference_index += segment_inference_count
+                overall_ratio = global_inference_index / max(total_inferences, 1)
+                elapsed = time.time() - pipeline_start_time
+                eta_seconds = 0.0
+                if overall_ratio > 0:
+                    eta_seconds = elapsed * (1.0 / overall_ratio - 1.0)
+                print(
+                    f"[Pililink] Segment {processed_segments}/{total_segments} done | "
+                    f"clips {global_inference_index}/{total_inferences} ({overall_ratio * 100:.1f}%) | "
+                    f"elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
+                )
 
                 del faces, boxes, affine_matrices, synced_video_frames, restored_segment, segment_video_frames
                 if clear_cuda_cache_per_segment and torch.cuda.is_available():
