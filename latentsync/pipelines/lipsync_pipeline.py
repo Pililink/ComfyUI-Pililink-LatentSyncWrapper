@@ -303,6 +303,22 @@ class LipsyncPipeline(DiffusionPipeline):
         images = images.cpu().numpy()
         return images
 
+    @staticmethod
+    def temporal_blend_frames(previous_frames: np.ndarray, current_frames: np.ndarray):
+        blend_len = min(len(previous_frames), len(current_frames))
+        if blend_len <= 0:
+            return np.empty((0,), dtype=np.uint8)
+
+        previous = previous_frames[:blend_len].astype(np.float32)
+        current = current_frames[:blend_len].astype(np.float32)
+        if blend_len == 1:
+            alpha = np.array([0.5], dtype=np.float32)
+        else:
+            alpha = np.linspace(0.0, 1.0, blend_len, dtype=np.float32)
+        alpha = alpha.reshape(blend_len, 1, 1, 1)
+        blended = previous * (1.0 - alpha) + current * alpha
+        return np.clip(blended, 0.0, 255.0).astype(np.uint8)
+
     def affine_transform_video(self, video_frames: np.ndarray):
         faces = []
         boxes = []

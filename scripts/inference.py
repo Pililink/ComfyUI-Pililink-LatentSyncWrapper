@@ -16,7 +16,7 @@ import argparse
 import os
 from omegaconf import OmegaConf
 import torch
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from accelerate.utils import set_seed
@@ -75,6 +75,37 @@ def maybe_enable_deepcache(pipeline, args, device_str):
         return None
 
 
+def load_scheduler(scheduler_path, scheduler_type="ddim"):
+    resolved_scheduler_type = str(scheduler_type or "ddim").strip().lower()
+    if resolved_scheduler_type not in {"ddim", "dpm_solver"}:
+        resolved_scheduler_type = "ddim"
+
+    if resolved_scheduler_type == "dpm_solver":
+        try:
+            return DPMSolverMultistepScheduler.from_pretrained(scheduler_path)
+        except Exception:
+            return DPMSolverMultistepScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                solver_order=2,
+                algorithm_type="dpmsolver++",
+            )
+
+    try:
+        return DDIMScheduler.from_pretrained(scheduler_path)
+    except Exception:
+        return DDIMScheduler(
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False,
+            steps_offset=1,
+            skip_prk_steps=True,
+        )
+
+
 def main(config, args):
     throw_if_processing_interrupted()
     if not os.path.exists(args.video_path):
@@ -86,7 +117,11 @@ def main(config, args):
     device_str = device.type if hasattr(device, "type") else str(device)
 
     # Check if the GPU supports float16
-    is_fp16_supported = device_str == "cuda" and torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
+    is_fp16_supported = (
+        device_str == "cuda"
+        and torch.cuda.is_available()
+        and int(torch.cuda.get_device_capability()[0]) >= 7
+    )
     dtype = torch.float16 if is_fp16_supported else torch.float32
 
     print(f"Input video path: {args.video_path}")
@@ -131,20 +166,12 @@ def main(config, args):
                 json.dump(scheduler_config, f, indent=2)
     
     print(f"Loading scheduler from: {scheduler_path}")
+    scheduler_type = str(getattr(args, "scheduler_type", "ddim")).strip().lower()
     try:
-        scheduler = DDIMScheduler.from_pretrained(scheduler_path)
+        scheduler = load_scheduler(scheduler_path, scheduler_type=scheduler_type)
     except Exception as e:
-        print(f"Error loading scheduler: {e}")
-        # Fallback to creating scheduler directly
-        scheduler = DDIMScheduler(
-            beta_start=0.00085,
-            beta_end=0.012,
-            beta_schedule="scaled_linear",
-            clip_sample=False,
-            set_alpha_to_one=False,
-            steps_offset=1,
-            skip_prk_steps=True
-        )
+        print(f"Error loading scheduler ({scheduler_type}): {e}")
+        scheduler = load_scheduler(scheduler_path, scheduler_type="ddim")
 
     # Resolve unified root for all model artifacts.
     latentsync_root = getattr(
@@ -221,6 +248,7 @@ def main(config, args):
             width=config.data.resolution,
             height=config.data.resolution,
             segment_inferences=getattr(args, "segment_inferences", 48),
+            segment_overlap_clips=max(0, int(getattr(args, "segment_overlap_clips", 0))),
             temp_dir=getattr(args, "temp_dir", "temp"),
             mask_image_path=config.data.mask_image_path,
         )
@@ -246,6 +274,8 @@ if __name__ == "__main__":
     parser.add_argument("--disable_deepcache", action="store_true")
     parser.add_argument("--deepcache_cache_interval", type=int, default=3)
     parser.add_argument("--deepcache_branch_id", type=int, default=0)
+    parser.add_argument("--scheduler_type", type=str, default="ddim")
+    parser.add_argument("--segment_overlap_clips", type=int, default=0)
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)

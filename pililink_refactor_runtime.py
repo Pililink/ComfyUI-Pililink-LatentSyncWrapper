@@ -3,7 +3,7 @@ import threading
 
 import torch
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers import AutoencoderKL, DDIMScheduler, DPMSolverMultistepScheduler
 from omegaconf import OmegaConf
 
 from latentsync.models.unet import UNet3DConditionModel
@@ -42,7 +42,24 @@ def _safe_cache_stamp(path):
         return f"{absolute_path}|missing"
 
 
-def _load_scheduler(scheduler_path):
+def _load_scheduler(scheduler_path, scheduler_type="ddim"):
+    resolved_scheduler_type = str(scheduler_type or "ddim").strip().lower()
+    if resolved_scheduler_type not in {"ddim", "dpm_solver"}:
+        resolved_scheduler_type = "ddim"
+
+    if resolved_scheduler_type == "dpm_solver":
+        try:
+            scheduler = DPMSolverMultistepScheduler.from_pretrained(scheduler_path)
+        except Exception:
+            scheduler = DPMSolverMultistepScheduler(
+                beta_start=0.00085,
+                beta_end=0.012,
+                beta_schedule="scaled_linear",
+                solver_order=2,
+                algorithm_type="dpmsolver++",
+            )
+        return scheduler
+
     try:
         return DDIMScheduler.from_pretrained(scheduler_path)
     except Exception:
@@ -118,6 +135,7 @@ class _RefactorRuntime:
         *,
         config,
         scheduler_path,
+        scheduler_type,
         inference_ckpt_path,
         whisper_model_path,
         audio_embeds_cache_dir,
@@ -127,7 +145,7 @@ class _RefactorRuntime:
     ):
         throw_if_processing_interrupted()
 
-        scheduler = _load_scheduler(scheduler_path)
+        scheduler = _load_scheduler(scheduler_path, scheduler_type=scheduler_type)
 
         audio_encoder = Audio2Feature(
             model_path=whisper_model_path,
@@ -165,6 +183,7 @@ class _RefactorRuntime:
         self.config = config
         self.device_str = device_str
         self.dtype = dtype
+        self.scheduler_type = str(scheduler_type or "ddim").strip().lower()
         self.pipeline = pipeline
         self.run_lock = threading.Lock()
 
@@ -187,6 +206,7 @@ class _RefactorRuntime:
         clip_batch_size,
         auto_oom_fallback,
         quality_mode,
+        segment_overlap_clips,
     ):
         with self.run_lock:
             throw_if_processing_interrupted()
@@ -263,6 +283,7 @@ class _RefactorRuntime:
                                     resolved_quality_mode == "quality_first" or current_clip_batch_size <= 1
                                 ),
                                 clip_batch_size=current_clip_batch_size,
+                                segment_overlap_clips=max(0, int(segment_overlap_clips)),
                             )
                         return
                     except Exception as exc:
@@ -314,10 +335,12 @@ def run_refactor_inference(
     deepcache,
     deepcache_cache_interval,
     deepcache_branch_id,
+    scheduler_type,
     skip_video_normalization,
     clip_batch_size,
     auto_oom_fallback,
     quality_mode,
+    segment_overlap_clips,
 ):
     throw_if_processing_interrupted()
 
@@ -331,6 +354,7 @@ def run_refactor_inference(
     cache_key = (
         device_str,
         str(dtype),
+        str(scheduler_type or "ddim").strip().lower(),
         _safe_cache_stamp(config_path),
         _safe_cache_stamp(scheduler_path),
         _safe_cache_stamp(inference_ckpt_path),
@@ -345,6 +369,7 @@ def run_refactor_inference(
             runtime = _RefactorRuntime(
                 config=config,
                 scheduler_path=scheduler_path,
+                scheduler_type=scheduler_type,
                 inference_ckpt_path=inference_ckpt_path,
                 whisper_model_path=whisper_model_path,
                 audio_embeds_cache_dir=audio_embeds_cache_dir,
@@ -371,4 +396,5 @@ def run_refactor_inference(
         clip_batch_size=clip_batch_size,
         auto_oom_fallback=auto_oom_fallback,
         quality_mode=quality_mode,
+        segment_overlap_clips=segment_overlap_clips,
     )
