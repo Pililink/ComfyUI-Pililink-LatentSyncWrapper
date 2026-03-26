@@ -1,5 +1,6 @@
 import argparse
 import atexit
+import copy
 import importlib.util
 import math
 import os
@@ -60,9 +61,13 @@ NODE_CATEGORY = "PililinkLatentSync"
 NODE_KEY_MAIN = "PililinkLatentSyncNode"
 NODE_KEY_ADJUSTER = "PililinkLatentSyncLengthAdjuster"
 NODE_KEY_MAIN_PATH = "PililinkLatentSyncVideoPathNode"
+NODE_KEY_MAIN_REFACTOR = "PililinkLatentSyncRefactorNode"
+NODE_KEY_MAIN_PATH_REFACTOR = "PililinkLatentSyncRefactorVideoPathNode"
 NODE_DISPLAY_MAIN = "Pililink LatentSync 1.5"
 NODE_DISPLAY_ADJUSTER = "Pililink LatentSync Length Adjuster"
 NODE_DISPLAY_MAIN_PATH = "Pililink LatentSync 1.5 (Video Path)"
+NODE_DISPLAY_MAIN_REFACTOR = "Pililink LatentSync 1.5 (Refactor)"
+NODE_DISPLAY_MAIN_PATH_REFACTOR = "Pililink LatentSync 1.5 (Video Path, Refactor)"
 _FFMPEG_VIDEO_ENCODERS = None
 _FACE_ROI_DETECTORS = {}
 
@@ -238,6 +243,14 @@ def import_inference_script(script_path):
         raise ImportError(f"Failed to execute module: {str(e)}")
 
     return module
+
+
+def import_refactor_runtime_module():
+    try:
+        from . import pililink_refactor_runtime as runtime_mod
+    except Exception:
+        import pililink_refactor_runtime as runtime_mod
+    return runtime_mod
 
 def check_ffmpeg():
     try:
@@ -1224,6 +1237,18 @@ class PililinkLatentSyncBase:
         check_and_install_dependencies()
         setup_models()
 
+    def _maybe_cuda_empty_cache(self, execution_settings=None, force=False):
+        if not torch.cuda.is_available():
+            return
+        if force:
+            torch.cuda.empty_cache()
+            return
+        aggressive = True
+        if isinstance(execution_settings, dict):
+            aggressive = bool(execution_settings.get("aggressive_cuda_cache_clear", True))
+        if aggressive:
+            torch.cuda.empty_cache()
+
     def _prepare_execution_settings(self, inference_steps, vram_usage):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         use_mixed_precision = False
@@ -1616,8 +1641,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
             
             # Free up memory after saving
             del frames_cpu
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._maybe_cuda_empty_cache(execution_settings)
 
             log_timing("Running Pililink inference")
             throw_if_processing_interrupted()
@@ -1639,8 +1663,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
             log_timing("Processing output")
             throw_if_processing_interrupted()
             # Clean GPU cache after inference
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._maybe_cuda_empty_cache(execution_settings)
 
             # Verify output file exists
             if not os.path.exists(output_video_path):
@@ -1682,8 +1705,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
 
         finally:
             # Cleanup GPU memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._maybe_cuda_empty_cache(execution_settings)
                 
             # Only remove temporary files if successful (keep for debugging if failed)
             try:
@@ -1700,8 +1722,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 pass  # Ignore cleanup errors
 
             # Final GPU cache cleanup
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._maybe_cuda_empty_cache(execution_settings)
 
 
 class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
@@ -2071,10 +2092,258 @@ class PililinkVideoLengthAdjuster:
                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
             )
 
+
+class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
+    def _get_refactor_runtime_options(self):
+        options = getattr(self, "_pililink_refactor_runtime_options", None)
+        if not isinstance(options, dict):
+            return {
+                "clip_batch_size": 1,
+                "auto_oom_fallback": True,
+                "quality_mode": "balanced",
+            }
+        return {
+            "clip_batch_size": max(1, int(options.get("clip_batch_size", 1))),
+            "auto_oom_fallback": bool(options.get("auto_oom_fallback", True)),
+            "quality_mode": str(options.get("quality_mode", "balanced")).lower(),
+        }
+
+    def _prepare_execution_settings(self, inference_steps, vram_usage):
+        runtime_options = self._get_refactor_runtime_options()
+        quality_mode = runtime_options["quality_mode"]
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        supports_fp16 = False
+        if device.type == "cuda" and torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()
+            # Turing (7.x) and newer GPUs can run fp16 inference efficiently.
+            supports_fp16 = int(capability[0]) >= 7
+        vram_mode = str(vram_usage or "medium").lower()
+        use_mixed_precision = (
+            quality_mode != "quality_first"
+            and supports_fp16
+            and vram_mode in {"high", "medium"}
+        )
+        dtype = torch.float16 if use_mixed_precision else torch.float32
+
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = quality_mode != "quality_first"
+            if hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.allow_tf32 = quality_mode != "quality_first"
+            torch.backends.cudnn.allow_tf32 = quality_mode != "quality_first"
+
+        return {
+            "device": device,
+            "batch_size": 1,
+            "use_mixed_precision": use_mixed_precision,
+            "dtype": dtype,
+            "aggressive_cuda_cache_clear": False,
+        }
+
+    @staticmethod
+    def _is_probably_25fps_video(video_path):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return False
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        finally:
+            cap.release()
+        if fps <= 0.0:
+            return False
+        return abs(fps - 25.0) < 0.01
+
+    @staticmethod
+    def _resolve_mask_image_path():
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
+        default_mask_path = os.path.join(cur_dir, "latentsync", "utils", "mask.png")
+        if os.path.exists(default_mask_path):
+            return default_mask_path
+        alt_mask_path = os.path.join(cur_dir, "utils", "mask.png")
+        if os.path.exists(alt_mask_path):
+            return alt_mask_path
+        return default_mask_path
+
+    def _run_inference(
+        self,
+        video_path,
+        audio_path,
+        output_video_path,
+        seed,
+        lips_expression,
+        inference_steps,
+        segment_inferences,
+        temp_dir,
+        execution_settings,
+        deepcache="on",
+        deepcache_cache_interval=3,
+        deepcache_branch_id=0,
+    ):
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
+        package_root = os.path.dirname(cur_dir)
+        if package_root not in sys.path:
+            sys.path.insert(0, package_root)
+        if cur_dir not in sys.path:
+            sys.path.insert(0, cur_dir)
+
+        runtime_mod = import_refactor_runtime_module()
+        config_path = os.path.join(cur_dir, "configs", "unet", "stage2.yaml")
+        scheduler_path = os.path.join(cur_dir, "configs", "scheduler")
+        ckpt_path = get_latentsync_path("latentsync_unet.pt")
+        mask_image_path = self._resolve_mask_image_path()
+        skip_video_normalization = self._is_probably_25fps_video(video_path)
+        runtime_options = self._get_refactor_runtime_options()
+
+        runtime_mod.run_refactor_inference(
+            config_path=config_path,
+            scheduler_path=scheduler_path,
+            inference_ckpt_path=ckpt_path,
+            latentsync_root=LATENTSYNC_ROOT_DIR,
+            audio_embeds_cache_dir=get_latentsync_path("runtime_cache", "audio_embeds"),
+            vae_model_path=get_latentsync_path("vae", "sd-vae-ft-mse"),
+            video_path=video_path,
+            audio_path=audio_path,
+            output_video_path=output_video_path,
+            seed=int(seed),
+            inference_steps=max(1, int(inference_steps)),
+            guidance_scale=float(lips_expression),
+            segment_inferences=max(2, int(segment_inferences)),
+            temp_dir=temp_dir,
+            device=execution_settings["device"],
+            dtype=execution_settings.get("dtype", torch.float32),
+            mask_image_path=mask_image_path,
+            deepcache=deepcache,
+            deepcache_cache_interval=max(1, int(deepcache_cache_interval)),
+            deepcache_branch_id=max(0, int(deepcache_branch_id)),
+            skip_video_normalization=skip_video_normalization,
+            clip_batch_size=runtime_options["clip_batch_size"],
+            auto_oom_fallback=runtime_options["auto_oom_fallback"],
+            quality_mode=runtime_options["quality_mode"],
+        )
+
+
+class PililinkLatentSyncRefactorNode(PililinkLatentSyncRefactorMixin, PililinkLatentSyncNode):
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_types = copy.deepcopy(PililinkLatentSyncNode.INPUT_TYPES())
+        input_types["required"]["clip_batch_size"] = ("INT", {"default": 1, "min": 1, "max": 16, "step": 1})
+        input_types["required"]["auto_oom_fallback"] = ("BOOLEAN", {"default": True})
+        input_types["required"]["quality_mode"] = (["balanced", "quality_first"], {"default": "balanced"})
+        return input_types
+
+    def inference(
+        self,
+        images,
+        audio,
+        seed,
+        lips_expression=1.5,
+        inference_steps=20,
+        vram_usage="medium",
+        segment_inferences=16,
+        deepcache="on",
+        deepcache_cache_interval=3,
+        deepcache_branch_id=0,
+        clip_batch_size=1,
+        auto_oom_fallback=True,
+        quality_mode="balanced",
+    ):
+        self._pililink_refactor_runtime_options = {
+            "clip_batch_size": clip_batch_size,
+            "auto_oom_fallback": auto_oom_fallback,
+            "quality_mode": quality_mode,
+        }
+        try:
+            return super().inference(
+                images=images,
+                audio=audio,
+                seed=seed,
+                lips_expression=lips_expression,
+                inference_steps=inference_steps,
+                vram_usage=vram_usage,
+                segment_inferences=segment_inferences,
+                deepcache=deepcache,
+                deepcache_cache_interval=deepcache_cache_interval,
+                deepcache_branch_id=deepcache_branch_id,
+            )
+        finally:
+            self._pililink_refactor_runtime_options = None
+
+
+class PililinkLatentSyncRefactorVideoPathNode(
+    PililinkLatentSyncRefactorMixin,
+    PililinkLatentSyncVideoPathNode,
+):
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_types = copy.deepcopy(PililinkLatentSyncVideoPathNode.INPUT_TYPES())
+        input_types["required"]["clip_batch_size"] = ("INT", {"default": 1, "min": 1, "max": 16, "step": 1})
+        input_types["required"]["auto_oom_fallback"] = ("BOOLEAN", {"default": True})
+        input_types["required"]["quality_mode"] = (["balanced", "quality_first"], {"default": "balanced"})
+        return input_types
+
+    def inference_from_path(
+        self,
+        video_path,
+        seed,
+        lips_expression=1.5,
+        inference_steps=20,
+        vram_usage="medium",
+        segment_inferences=16,
+        deepcache="on",
+        deepcache_cache_interval=3,
+        deepcache_branch_id=0,
+        mode="normal",
+        silent_padding_sec=0.5,
+        auto_silent_padding=False,
+        result_mode="memory_only",
+        face_roi_pre_crop="off",
+        roi_padding_ratio=0.35,
+        roi_sample_frames=12,
+        filename_prefix="LatentSync/Pililink",
+        audio=None,
+        audio_path="",
+        output_path="",
+        clip_batch_size=1,
+        auto_oom_fallback=True,
+        quality_mode="balanced",
+    ):
+        self._pililink_refactor_runtime_options = {
+            "clip_batch_size": clip_batch_size,
+            "auto_oom_fallback": auto_oom_fallback,
+            "quality_mode": quality_mode,
+        }
+        try:
+            return super().inference_from_path(
+                video_path=video_path,
+                seed=seed,
+                lips_expression=lips_expression,
+                inference_steps=inference_steps,
+                vram_usage=vram_usage,
+                segment_inferences=segment_inferences,
+                deepcache=deepcache,
+                deepcache_cache_interval=deepcache_cache_interval,
+                deepcache_branch_id=deepcache_branch_id,
+                mode=mode,
+                silent_padding_sec=silent_padding_sec,
+                auto_silent_padding=auto_silent_padding,
+                result_mode=result_mode,
+                face_roi_pre_crop=face_roi_pre_crop,
+                roi_padding_ratio=roi_padding_ratio,
+                roi_sample_frames=roi_sample_frames,
+                filename_prefix=filename_prefix,
+                audio=audio,
+                audio_path=audio_path,
+                output_path=output_path,
+            )
+        finally:
+            self._pililink_refactor_runtime_options = None
+
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
     NODE_KEY_MAIN: PililinkLatentSyncNode,
     NODE_KEY_MAIN_PATH: PililinkLatentSyncVideoPathNode,
+    NODE_KEY_MAIN_REFACTOR: PililinkLatentSyncRefactorNode,
+    NODE_KEY_MAIN_PATH_REFACTOR: PililinkLatentSyncRefactorVideoPathNode,
     NODE_KEY_ADJUSTER: PililinkVideoLengthAdjuster,
 }
 
@@ -2082,5 +2351,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_KEY_MAIN: NODE_DISPLAY_MAIN,
     NODE_KEY_MAIN_PATH: NODE_DISPLAY_MAIN_PATH,
+    NODE_KEY_MAIN_REFACTOR: NODE_DISPLAY_MAIN_REFACTOR,
+    NODE_KEY_MAIN_PATH_REFACTOR: NODE_DISPLAY_MAIN_PATH_REFACTOR,
     NODE_KEY_ADJUSTER: NODE_DISPLAY_ADJUSTER,
 }
