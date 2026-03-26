@@ -2210,6 +2210,8 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
         deepcache="on",
         deepcache_cache_interval=3,
         deepcache_branch_id=0,
+        scheduler_type="ddim",
+        segment_overlap_clips=0,
     ):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         package_root = os.path.dirname(cur_dir)
@@ -2225,6 +2227,19 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
         mask_image_path = self._resolve_mask_image_path()
         skip_video_normalization = self._is_probably_25fps_video(video_path)
         runtime_options = self._get_refactor_runtime_options()
+        resolved_scheduler_type = str(
+            scheduler_type or runtime_options.get("scheduler_type", "ddim")
+        ).strip().lower()
+        if resolved_scheduler_type not in {"ddim", "dpm_solver"}:
+            resolved_scheduler_type = "ddim"
+        resolved_segment_overlap_clips = max(
+            0,
+            int(
+                segment_overlap_clips
+                if segment_overlap_clips is not None
+                else runtime_options.get("segment_overlap_clips", 0)
+            ),
+        )
 
         runtime_mod.run_refactor_inference(
             config_path=config_path,
@@ -2247,12 +2262,12 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
             deepcache=deepcache,
             deepcache_cache_interval=max(1, int(deepcache_cache_interval)),
             deepcache_branch_id=max(0, int(deepcache_branch_id)),
-            scheduler_type=runtime_options["scheduler_type"],
+            scheduler_type=resolved_scheduler_type,
             skip_video_normalization=skip_video_normalization,
             clip_batch_size=runtime_options["clip_batch_size"],
             auto_oom_fallback=runtime_options["auto_oom_fallback"],
             quality_mode=runtime_options["quality_mode"],
-            segment_overlap_clips=runtime_options["segment_overlap_clips"],
+            segment_overlap_clips=resolved_segment_overlap_clips,
         )
 
 
