@@ -252,6 +252,7 @@ def main(config, args):
             affine_detect_interval=max(1, int(getattr(args, "affine_detect_interval", 1))),
             temp_dir=getattr(args, "temp_dir", "temp"),
             mask_image_path=config.data.mask_image_path,
+            skip_video_normalization=getattr(args, "skip_video_normalization", False),
         )
     finally:
         if deepcache_helper is not None and hasattr(deepcache_helper, "disable"):

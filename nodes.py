@@ -69,7 +69,6 @@ NODE_DISPLAY_MAIN_PATH = "Pililink LatentSync 1.5 (Video Path)"
 NODE_DISPLAY_MAIN_REFACTOR = "Pililink LatentSync 1.5 (Refactor)"
 NODE_DISPLAY_MAIN_PATH_REFACTOR = "Pililink LatentSync 1.5 (Video Path, Refactor)"
 _FFMPEG_VIDEO_ENCODERS = None
-_FACE_ROI_DETECTORS = {}
 
 # Function to check for potential conflicts with other LatentSync implementations
 def check_for_conflicts():
@@ -329,6 +328,23 @@ def check_and_install_dependencies():
             f.write(f"Pililink dependencies checked on {time.ctime()}")
     except Exception as e:
         print(f"Warning: Could not create cache marker file: {str(e)}")
+
+def is_probably_25fps_video(video_path):
+    """Check if a video file is already at ~25fps, so FFmpeg normalization can be skipped."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return False
+        try:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        finally:
+            cap.release()
+        if fps <= 0.0:
+            return False
+        return abs(fps - 25.0) < 0.01
+    except Exception:
+        return False
+
 
 def normalize_path(path):
     """Normalize path to handle spaces and special characters"""
@@ -984,249 +1000,6 @@ def load_video_path_node_outputs(video_path):
     return images, int(images.shape[0]), audio, video_info
 
 
-def get_face_roi_detector(device_str):
-    global _FACE_ROI_DETECTORS
-
-    normalized_device = "cuda" if device_str == "cuda" and torch.cuda.is_available() else "cpu"
-    detector = _FACE_ROI_DETECTORS.get(normalized_device)
-    if detector is not None:
-        return detector
-
-    try:
-        import face_alignment
-    except Exception as exc:
-        raise RuntimeError("Pililink: face-alignment is required for face ROI pre-crop mode") from exc
-
-    detector = face_alignment.FaceAlignment(
-        face_alignment.LandmarksType.TWO_D,
-        flip_input=False,
-        device=normalized_device,
-    )
-    _FACE_ROI_DETECTORS[normalized_device] = detector
-    return detector
-
-
-def ensure_even_face_roi(roi, frame_width, frame_height):
-    x = int(max(0, min(frame_width - 2, roi["x"])))
-    y = int(max(0, min(frame_height - 2, roi["y"])))
-    w = int(max(2, min(frame_width - x, roi["w"])))
-    h = int(max(2, min(frame_height - y, roi["h"])))
-
-    if x % 2 != 0:
-        x = max(0, x - 1)
-    if y % 2 != 0:
-        y = max(0, y - 1)
-    if w % 2 != 0:
-        w = max(2, w - 1)
-    if h % 2 != 0:
-        h = max(2, h - 1)
-
-    if x + w > frame_width:
-        w = frame_width - x
-        if w % 2 != 0:
-            w = max(2, w - 1)
-    if y + h > frame_height:
-        h = frame_height - y
-        if h % 2 != 0:
-            h = max(2, h - 1)
-
-    if w < 2 or h < 2:
-        raise RuntimeError("Pililink: invalid face ROI computed for pre-crop mode")
-
-    return {"x": x, "y": y, "w": w, "h": h}
-
-
-def build_face_roi_from_landmarks(landmarks, frame_width, frame_height, padding_ratio):
-    padding_ratio = max(0.0, float(padding_ratio))
-    min_x = float(np.min(landmarks[:, 0]))
-    max_x = float(np.max(landmarks[:, 0]))
-    min_y = float(np.min(landmarks[:, 1]))
-    max_y = float(np.max(landmarks[:, 1]))
-
-    base_width = max(2.0, max_x - min_x)
-    base_height = max(2.0, max_y - min_y)
-    horizontal_padding = base_width * padding_ratio
-    top_padding = base_height * padding_ratio * 0.8
-    bottom_padding = base_height * padding_ratio * 1.35
-
-    roi = {
-        "x": int(round(min_x - horizontal_padding)),
-        "y": int(round(min_y - top_padding)),
-        "w": int(round(base_width + horizontal_padding * 2)),
-        "h": int(round(base_height + top_padding + bottom_padding)),
-    }
-    return ensure_even_face_roi(roi, frame_width, frame_height)
-
-
-def select_stable_face_roi(rois):
-    if not rois:
-        raise RuntimeError("Pililink: no face ROI candidates were collected")
-
-    if len(rois) == 1:
-        return rois[0]
-
-    roi_array = np.array([[roi["x"], roi["y"], roi["w"], roi["h"]] for roi in rois], dtype=np.float32)
-    roi_median = np.median(roi_array, axis=0)
-    distances = np.abs(roi_array - roi_median).sum(axis=1)
-    best_index = int(np.argmin(distances))
-    return rois[best_index]
-
-
-def detect_face_roi_for_video(video_path, device_str, padding_ratio=0.35, sample_frames=12, max_detection_size=960):
-    detector = get_face_roi_detector(device_str)
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Pililink: failed to open video for face ROI detection: {video_path}")
-
-    rois = []
-    try:
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if total_frames <= 0:
-            sample_indices = [0]
-        else:
-            sample_count = max(1, min(int(sample_frames), total_frames))
-            if sample_count == 1:
-                sample_indices = [0]
-            else:
-                sample_indices = sorted(
-                    {
-                        int(round(index * (total_frames - 1) / (sample_count - 1)))
-                        for index in range(sample_count)
-                    }
-                )
-
-        for frame_index in sample_indices:
-            throw_if_processing_interrupted()
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            success, frame_bgr = cap.read()
-            if not success or frame_bgr is None:
-                continue
-
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_height, frame_width = frame_rgb.shape[:2]
-            detection_frame = frame_rgb
-            scale = 1.0
-            max_dim = max(frame_width, frame_height)
-            if max_dim > max_detection_size:
-                scale = max_detection_size / float(max_dim)
-                detection_frame = cv2.resize(
-                    frame_rgb,
-                    (max(2, int(round(frame_width * scale))), max(2, int(round(frame_height * scale)))),
-                    interpolation=cv2.INTER_AREA,
-                )
-
-            detected_faces = detector.get_landmarks(detection_frame)
-            if not detected_faces:
-                continue
-
-            largest_landmarks = None
-            largest_area = -1.0
-            for landmarks in detected_faces:
-                landmarks = np.asarray(landmarks, dtype=np.float32)
-                width = float(np.max(landmarks[:, 0]) - np.min(landmarks[:, 0]))
-                height = float(np.max(landmarks[:, 1]) - np.min(landmarks[:, 1]))
-                area = width * height
-                if area > largest_area:
-                    largest_area = area
-                    largest_landmarks = landmarks
-
-            if largest_landmarks is None:
-                continue
-
-            if scale != 1.0:
-                largest_landmarks = largest_landmarks / scale
-
-            rois.append(build_face_roi_from_landmarks(largest_landmarks, frame_width, frame_height, padding_ratio))
-    finally:
-        cap.release()
-
-    if not rois:
-        raise RuntimeError("Face not detected")
-
-    selected_roi = select_stable_face_roi(rois)
-    print(f"Pililink: Selected face ROI {selected_roi}")
-    return selected_roi
-
-
-def crop_video_to_face_roi(video_path, output_path, roi):
-    def build_command(codec):
-        return [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            video_path,
-            "-filter:v",
-            f"crop={roi['w']}:{roi['h']}:{roi['x']}:{roi['y']}",
-            "-an",
-            *get_ffmpeg_video_encode_args(codec),
-            output_path,
-        ]
-
-    run_ffmpeg_video_command_with_fallback(build_command, f"Failed to crop face ROI from video: {video_path}")
-    if not os.path.exists(output_path):
-        raise RuntimeError(f"Pililink: cropped face ROI video missing: {output_path}")
-    return output_path
-
-
-def merge_face_result_back(background_video_path, face_result_video_path, output_path, roi):
-    margin_x = max(4, min(24, int(round(roi["w"] * 0.08))))
-    margin_y = max(4, min(24, int(round(roi["h"] * 0.08))))
-    inner_w = max(2, roi["w"] - margin_x * 2)
-    inner_h = max(2, roi["h"] - margin_y * 2)
-    if inner_w % 2 != 0:
-        inner_w -= 1
-    if inner_h % 2 != 0:
-        inner_h -= 1
-    if inner_w < 2 or inner_h < 2:
-        margin_x = 0
-        margin_y = 0
-        inner_w = roi["w"]
-        inner_h = roi["h"]
-
-    def build_command(codec):
-        return [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            background_video_path,
-            "-i",
-            face_result_video_path,
-            "-filter_complex",
-            (
-                f"[1:v]scale={roi['w']}:{roi['h']},"
-                f"crop={inner_w}:{inner_h}:{margin_x}:{margin_y}[face];"
-                f"[0:v][face]overlay={roi['x'] + margin_x}:{roi['y'] + margin_y}:shortest=1[v]"
-            ),
-            "-map",
-            "[v]",
-            "-map",
-            "1:a?",
-            *get_ffmpeg_video_encode_args(codec),
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            output_path,
-        ]
-
-    run_ffmpeg_video_command_with_fallback(
-        build_command,
-        f"Failed to merge lip-synced face ROI back to video: {background_video_path}",
-    )
-    if not os.path.exists(output_path):
-        raise RuntimeError(f"Pililink: merged face ROI video missing: {output_path}")
-    return output_path
-
-
 class PililinkLatentSyncBase:
     def __init__(self):
         # Make sure our temp directory is the current one
@@ -1309,6 +1082,7 @@ class PililinkLatentSyncBase:
         scheduler_type="ddim",
         segment_overlap_clips=0,
         affine_detect_interval=1,
+        skip_video_normalization=False,
     ):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         inference_script_path = os.path.join(cur_dir, "scripts", "inference.py")
@@ -1357,6 +1131,7 @@ class PililinkLatentSyncBase:
             scheduler_type=str(scheduler_type or "ddim").lower(),
             segment_overlap_clips=max(0, int(segment_overlap_clips)),
             affine_detect_interval=max(1, int(affine_detect_interval)),
+            skip_video_normalization=bool(skip_video_normalization),
         )
 
         return cur_dir, inference_script_path, config, args
@@ -1378,6 +1153,7 @@ class PililinkLatentSyncBase:
         scheduler_type="ddim",
         segment_overlap_clips=0,
         affine_detect_interval=1,
+        skip_video_normalization=False,
     ):
         cur_dir, inference_script_path, config, args = self._build_inference_args(
             video_path=video_path,
@@ -1395,6 +1171,7 @@ class PililinkLatentSyncBase:
             scheduler_type=scheduler_type,
             segment_overlap_clips=segment_overlap_clips,
             affine_detect_interval=affine_detect_interval,
+            skip_video_normalization=skip_video_normalization,
         )
 
         package_root = os.path.dirname(cur_dir)
@@ -1418,106 +1195,6 @@ class PililinkLatentSyncBase:
         # more reliable with normal tensors, so we explicitly disable it here.
         with torch.inference_mode(False):
             inference_module.main(config, args)
-
-    def _run_inference_with_optional_face_roi(
-        self,
-        video_path,
-        audio_path,
-        output_video_path,
-        seed,
-        lips_expression,
-        inference_steps,
-        segment_inferences,
-        temp_dir,
-        execution_settings,
-        face_roi_pre_crop="off",
-        roi_padding_ratio=0.35,
-        roi_sample_frames=12,
-        deepcache="on",
-        deepcache_cache_interval=3,
-        deepcache_branch_id=0,
-        scheduler_type="ddim",
-        segment_overlap_clips=0,
-        affine_detect_interval=1,
-    ):
-        pre_crop_mode = str(face_roi_pre_crop or "off").lower()
-        if pre_crop_mode not in {"off", "auto", "force"}:
-            raise ValueError(f"Pililink: unsupported face ROI pre-crop mode: {face_roi_pre_crop}")
-
-        if pre_crop_mode == "off":
-            self._run_inference(
-                video_path=video_path,
-                audio_path=audio_path,
-                output_video_path=output_video_path,
-                seed=seed,
-                lips_expression=lips_expression,
-                inference_steps=inference_steps,
-                segment_inferences=segment_inferences,
-                temp_dir=temp_dir,
-                execution_settings=execution_settings,
-                deepcache=deepcache,
-                deepcache_cache_interval=deepcache_cache_interval,
-                deepcache_branch_id=deepcache_branch_id,
-                scheduler_type=scheduler_type,
-                segment_overlap_clips=segment_overlap_clips,
-                affine_detect_interval=affine_detect_interval,
-            )
-            return
-
-        device = execution_settings["device"]
-        device_str = device.type if hasattr(device, "type") else str(device)
-        cropped_video_path = os.path.join(temp_dir, "pililink_face_roi_input.mp4")
-        face_result_path = os.path.join(temp_dir, "pililink_face_roi_output.mp4")
-
-        try:
-            print(f"Pililink: Running face ROI pre-crop mode ({pre_crop_mode})")
-            roi = detect_face_roi_for_video(
-                video_path,
-                device_str=device_str,
-                padding_ratio=roi_padding_ratio,
-                sample_frames=roi_sample_frames,
-            )
-            crop_video_to_face_roi(video_path, cropped_video_path, roi)
-            self._run_inference(
-                video_path=cropped_video_path,
-                audio_path=audio_path,
-                output_video_path=face_result_path,
-                seed=seed,
-                lips_expression=lips_expression,
-                inference_steps=inference_steps,
-                segment_inferences=segment_inferences,
-                temp_dir=temp_dir,
-                execution_settings=execution_settings,
-                deepcache=deepcache,
-                deepcache_cache_interval=deepcache_cache_interval,
-                deepcache_branch_id=deepcache_branch_id,
-                scheduler_type=scheduler_type,
-                segment_overlap_clips=segment_overlap_clips,
-                affine_detect_interval=affine_detect_interval,
-            )
-            merge_face_result_back(video_path, face_result_path, output_video_path, roi)
-        except Exception as exc:
-            if pre_crop_mode == "auto":
-                print(f"Pililink: Face ROI pre-crop fallback to full-frame inference due to: {exc}")
-                self._run_inference(
-                    video_path=video_path,
-                    audio_path=audio_path,
-                    output_video_path=output_video_path,
-                    seed=seed,
-                    lips_expression=lips_expression,
-                    inference_steps=inference_steps,
-                    segment_inferences=segment_inferences,
-                    temp_dir=temp_dir,
-                    execution_settings=execution_settings,
-                    deepcache=deepcache,
-                    deepcache_cache_interval=deepcache_cache_interval,
-                    deepcache_branch_id=deepcache_branch_id,
-                    scheduler_type=scheduler_type,
-                    segment_overlap_clips=segment_overlap_clips,
-                    affine_detect_interval=affine_detect_interval,
-                )
-                return
-            raise
 
 
 class PililinkLatentSyncNode(PililinkLatentSyncBase):
@@ -1691,6 +1368,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
                 affine_detect_interval=affine_detect_interval,
+                skip_video_normalization=True,
             )
 
             log_timing("Processing output")
@@ -1779,9 +1457,6 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 3.0, "step": 0.1}),
                 "auto_silent_padding": ("BOOLEAN", {"default": False}),
                 "result_mode": (["memory_only", "both"], {"default": "memory_only"}),
-                "face_roi_pre_crop": (["off", "auto", "force"], {"default": "off"}),
-                "roi_padding_ratio": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
-                "roi_sample_frames": ("INT", {"default": 12, "min": 4, "max": 48, "step": 2}),
                 "filename_prefix": ("STRING", {"default": "LatentSync/Pililink"}),
             },
             "optional": {
@@ -1815,9 +1490,6 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
         silent_padding_sec=0.5,
         auto_silent_padding=False,
         result_mode="memory_only",
-        face_roi_pre_crop="off",
-        roi_padding_ratio=0.35,
-        roi_sample_frames=12,
         filename_prefix="LatentSync/Pililink",
         audio=None,
         audio_path="",
@@ -1864,7 +1536,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             else:
                 print(f"Pililink: Writing temporary result video to {final_output_path}")
 
-            self._run_inference_with_optional_face_roi(
+            self._run_inference(
                 video_path=aligned_video_path,
                 audio_path=aligned_audio_path,
                 output_video_path=final_output_path,
@@ -1874,15 +1546,13 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 segment_inferences=segment_inferences,
                 temp_dir=temp_dir,
                 execution_settings=execution_settings,
-                face_roi_pre_crop=face_roi_pre_crop,
-                roi_padding_ratio=roi_padding_ratio,
-                roi_sample_frames=roi_sample_frames,
                 deepcache=deepcache,
                 deepcache_cache_interval=deepcache_cache_interval,
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
                 segment_overlap_clips=segment_overlap_clips,
                 affine_detect_interval=affine_detect_interval,
+                skip_video_normalization=is_probably_25fps_video(aligned_video_path),
             )
 
             total_time = time.time() - start_time
@@ -2190,16 +1860,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
 
     @staticmethod
     def _is_probably_25fps_video(video_path):
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            return False
-        try:
-            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        finally:
-            cap.release()
-        if fps <= 0.0:
-            return False
-        return abs(fps - 25.0) < 0.01
+        return is_probably_25fps_video(video_path)
 
     @staticmethod
     def _resolve_mask_image_path():
@@ -2229,6 +1890,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
         scheduler_type="ddim",
         segment_overlap_clips=0,
         affine_detect_interval=1,
+        skip_video_normalization=False,
     ):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         package_root = os.path.dirname(cur_dir)
@@ -2242,7 +1904,7 @@ class PililinkLatentSyncRefactorMixin(PililinkLatentSyncBase):
         scheduler_path = os.path.join(cur_dir, "configs", "scheduler")
         ckpt_path = get_latentsync_path("latentsync_unet.pt")
         mask_image_path = self._resolve_mask_image_path()
-        skip_video_normalization = self._is_probably_25fps_video(video_path)
+        skip_video_normalization = skip_video_normalization or self._is_probably_25fps_video(video_path)
         runtime_options = self._get_refactor_runtime_options()
         resolved_scheduler_type = str(
             scheduler_type or runtime_options.get("scheduler_type", "ddim")
@@ -2383,9 +2045,6 @@ class PililinkLatentSyncRefactorVideoPathNode(
         silent_padding_sec=0.5,
         auto_silent_padding=False,
         result_mode="memory_only",
-        face_roi_pre_crop="off",
-        roi_padding_ratio=0.35,
-        roi_sample_frames=12,
         filename_prefix="LatentSync/Pililink",
         audio=None,
         audio_path="",
@@ -2420,9 +2079,6 @@ class PililinkLatentSyncRefactorVideoPathNode(
                 silent_padding_sec=silent_padding_sec,
                 auto_silent_padding=auto_silent_padding,
                 result_mode=result_mode,
-                face_roi_pre_crop=face_roi_pre_crop,
-                roi_padding_ratio=roi_padding_ratio,
-                roi_sample_frames=roi_sample_frames,
                 filename_prefix=filename_prefix,
                 audio=audio,
                 audio_path=audio_path,

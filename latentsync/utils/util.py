@@ -96,6 +96,133 @@ def get_ffmpeg_video_encode_args(codec=None):
     return ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p"]
 
 
+def open_ffmpeg_video_pipe_writer(output_path, width, height, fps=25):
+    """Open an FFmpeg subprocess that accepts raw BGR24 frames on stdin and encodes to h264.
+
+    Returns (process, codec_used).  The caller must:
+      1. Write raw frame bytes to ``process.stdin``
+      2. Call ``process.stdin.close()`` when done
+      3. Call ``process.wait()`` and check ``process.returncode``
+    """
+    codec = get_preferred_ffmpeg_video_codec()
+    codecs_to_try = [codec]
+    if codec != "libx264":
+        codecs_to_try.append("libx264")
+
+    last_error = None
+    for c in codecs_to_try:
+        command = [
+            "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+            "-f", "rawvideo",
+            "-pixel_format", "bgr24",
+            "-video_size", f"{width}x{height}",
+            "-framerate", str(fps),
+            "-i", "pipe:0",
+            *get_ffmpeg_video_encode_args(c),
+            output_path,
+        ]
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            # Quick sanity check — if the process already died the codec is bad.
+            if proc.poll() is not None:
+                stderr_out = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+                raise RuntimeError(f"FFmpeg exited immediately: {stderr_out}")
+            return proc, c
+        except Exception as e:
+            last_error = e
+            if c != "libx264":
+                print(f"LatentSync util: FFmpeg pipe writer with {c} failed, trying libx264")
+            continue
+
+    raise RuntimeError(f"Failed to open FFmpeg pipe writer: {last_error}")
+
+
+def close_ffmpeg_video_pipe_writer(proc, timeout=60):
+    """Gracefully close an FFmpeg pipe writer subprocess.
+
+    Returns True on success, raises on failure.
+    """
+    if proc is None:
+        return True
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+        proc.wait(timeout=timeout)
+        if proc.returncode != 0:
+            stderr_out = ""
+            if proc.stderr:
+                stderr_out = proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"FFmpeg pipe writer failed (exit {proc.returncode}): {stderr_out}")
+        return True
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise
+
+
+def mux_video_audio_stream_copy(video_path, audio_path, output_path, duration=None):
+    """Mux a video (already h264) with audio using stream copy (near-instant).
+
+    Falls back to re-encoding on failure.
+    """
+    duration_args = ["-t", f"{duration:.6f}"] if duration is not None else []
+    # Fast path: stream copy video + encode audio
+    mux_command = [
+        "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+        "-i", video_path,
+        "-i", audio_path,
+        *duration_args,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(mux_command, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    # Fallback: re-encode video with codec chain
+    print(f"[LatentSync] Stream-copy mux failed ({result.stderr.strip()}), falling back to re-encode")
+    preferred_codec = get_preferred_ffmpeg_video_codec()
+    codecs_to_try = [preferred_codec]
+    if preferred_codec != "libx264":
+        codecs_to_try.append("libx264")
+
+    last_error = None
+    for codec in codecs_to_try:
+        command = [
+            "ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+            "-i", video_path,
+            "-i", audio_path,
+            *duration_args,
+            *get_ffmpeg_video_encode_args(codec),
+            "-c:a", "aac",
+            output_path,
+        ]
+        re_result = subprocess.run(command, capture_output=True, text=True)
+        if re_result.returncode == 0:
+            if codec != preferred_codec:
+                print(f"[LatentSync] ffmpeg fallback succeeded with {codec}")
+            return
+        last_error = RuntimeError(
+            f"ffmpeg re-encode failed (exit {re_result.returncode}) with {codec}: {re_result.stderr.strip()}"
+        )
+        if codec != "libx264":
+            print(f"[LatentSync] ffmpeg {codec} failed, trying libx264")
+            continue
+        raise last_error
+
+    if last_error is not None:
+        raise last_error
+
+
 def run_ffmpeg_command(command, error_message):
     result = subprocess.run(
         command,

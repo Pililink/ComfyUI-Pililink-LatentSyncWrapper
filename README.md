@@ -108,9 +108,6 @@ latensync1.5/
 - `silent_padding_sec`：补齐音频时附加的静音秒数
 - `auto_silent_padding`：自动根据视频和音频时长差计算静音补齐时长；例如视频 50s、音频 10s 时，会自动补约 40s 静音
 - `result_mode`：结果输出模式，`memory_only` 表示仅把结果交给后续节点并自动清理过程文件，`both` 表示同时保留输出 mp4 文件
-- `face_roi_pre_crop`：面部预裁剪模式，支持 `off` / `auto` / `force`
-- `roi_padding_ratio`：面部 ROI 额外留白比例，避免嘴部和下巴出框
-- `roi_sample_frames`：用于检测稳定人脸 ROI 的采样帧数
 - `filename_prefix`：输出到 ComfyUI `output` 目录时使用的前缀
 - `output_path`：可选，直接指定最终输出 mp4 的绝对路径
 - `seed` / `lips_expression` / `inference_steps` / `vram_usage` / `segment_inferences`：与主节点一致
@@ -124,12 +121,6 @@ latensync1.5/
 - `normal`：对齐到较短一侧；如果视频比音频长，会先给音频补一小段静音再裁视频；如果音频比视频长，则裁音频
 - `pingpong`：当音频比视频长时，把视频做往返播放扩展到音频时长；当音频较短时，保留原视频并给音频补静音
 - `loop_to_audio`：循环视频直到覆盖音频时长，并可附加静音尾巴
-
-面部预裁剪模式说明：
-
-- `off`：关闭，保持当前全帧流程
-- `auto`：先尝试检测稳定面部 ROI，裁脸推理后再贴回；如果失败会自动回退到全帧流程
-- `force`：强制走面部 ROI 裁剪链路；如果 ROI 检测或合并失败则直接报错
 
 ---
 

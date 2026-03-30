@@ -34,10 +34,13 @@ import cv2
 from ..models.unet import UNet3DConditionModel
 from ..utils.util import (
     check_ffmpeg_installed,
+    close_ffmpeg_video_pipe_writer,
     get_ffmpeg_video_encode_args,
     get_preferred_ffmpeg_video_codec,
     get_video_frame_count,
     iter_video_cv2,
+    mux_video_audio_stream_copy,
+    open_ffmpeg_video_pipe_writer,
     prepare_video_for_processing,
     read_audio,
     write_video,
@@ -481,6 +484,15 @@ class LipsyncPipeline(DiffusionPipeline):
         clear_cuda_cache_per_segment = bool(kwargs.get("clear_cuda_cache_per_segment", True))
         affine_detect_interval = max(1, int(kwargs.get("affine_detect_interval", 1)))
 
+        _pipeline_t0 = time.time()
+
+        def _log_step(label):
+            print(f"[Pililink {time.time() - _pipeline_t0:.2f}s] {label}")
+
+        _log_step("Pipeline start | preparing audio features & video normalization")
+        if skip_video_normalization:
+            _log_step("Video normalization SKIPPED (already 25fps)")
+
         executor = ThreadPoolExecutor(max_workers=2)
         try:
             whisper_feature_future = executor.submit(self.audio_encoder.audio2feat, audio_path)
@@ -493,14 +505,17 @@ class LipsyncPipeline(DiffusionPipeline):
                     stream_temp_dir,
                 )
             whisper_feature = wait_for_future_with_interrupt(whisper_feature_future)
+            _log_step("Audio feature extraction done")
             if normalized_video_future is None:
                 normalized_video_path = video_path
             else:
                 normalized_video_path = wait_for_future_with_interrupt(normalized_video_future)
+                _log_step("Video normalization done")
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+        _log_step(f"Whisper chunks ready ({len(whisper_chunks)} chunks)")
         throw_if_processing_interrupted()
         total_frames = get_video_frame_count(normalized_video_path)
         total_aligned_frames = (total_frames // num_frames) * num_frames
@@ -545,6 +560,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     continue
 
                 processed_segments += 1
+                _seg_t0 = time.time()
                 print(
                     f"[Pililink] Segment {processed_segments}/{total_segments} start | "
                     f"clips {global_inference_index}/{total_inferences} | "
@@ -555,6 +571,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 faces, boxes, affine_matrices = self.affine_transform_video(
                     segment_video_frames, affine_detect_interval=affine_detect_interval
                 )
+                _log_step(f"Segment {processed_segments} | affine transform done ({time.time() - _seg_t0:.2f}s)")
 
                 num_channels_latents = self.vae.config.latent_channels
 
@@ -678,18 +695,24 @@ class LipsyncPipeline(DiffusionPipeline):
                     del ref_pixel_values_flat, masks_flat
                     del mask_latents, masked_image_latents, ref_latents, decoded_latents
 
+                _restore_t0 = time.time()
                 restored_segment = self.restore_video(
                     torch.cat(synced_video_frames), segment_video_frames, boxes, affine_matrices
                 )
+                _log_step(f"Segment {processed_segments} | face restore done ({time.time() - _restore_t0:.2f}s)")
 
                 if video_writer is None:
                     h, w = restored_segment[0].shape[:2]
-                    video_writer = cv2.VideoWriter(final_video_path, cv2.VideoWriter_fourcc(*"mp4v"), video_fps, (w, h))
-                    if not video_writer.isOpened():
-                        raise RuntimeError(f"Failed to open output writer: {final_video_path}")
+                    video_writer, _writer_codec = open_ffmpeg_video_pipe_writer(
+                        final_video_path, w, h, fps=video_fps
+                    )
+                    _log_step(f"FFmpeg pipe writer opened ({_writer_codec}, {w}x{h})")
 
+                _write_t0 = time.time()
                 for frame in restored_segment:
-                    video_writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    video_writer.stdin.write(bgr.tobytes())
+                _log_step(f"Segment {processed_segments} | {restored_segment.shape[0]} frames written ({time.time() - _write_t0:.2f}s)")
 
                 processed_frame_count += restored_segment.shape[0]
                 global_inference_index += segment_inference_count
@@ -709,11 +732,21 @@ class LipsyncPipeline(DiffusionPipeline):
                     torch.cuda.empty_cache()
         finally:
             if video_writer is not None:
-                video_writer.release()
+                try:
+                    _close_t0 = time.time()
+                    close_ffmpeg_video_pipe_writer(video_writer, timeout=60)
+                    _log_step(f"FFmpeg pipe writer closed ({time.time() - _close_t0:.2f}s)")
+                except Exception as e:
+                    print(f"[Pililink] FFmpeg pipe writer cleanup warning: {e}")
                 video_writer = None
 
         if video_writer is not None:
-            video_writer.release()
+            try:
+                _close_t0 = time.time()
+                close_ffmpeg_video_pipe_writer(video_writer, timeout=60)
+                _log_step(f"FFmpeg pipe writer closed ({time.time() - _close_t0:.2f}s)")
+            except Exception as e:
+                print(f"[Pililink] FFmpeg pipe writer cleanup warning: {e}")
             video_writer = None
 
         if is_train:
@@ -723,68 +756,11 @@ class LipsyncPipeline(DiffusionPipeline):
             raise RuntimeError("No output frames produced during segmented inference")
 
         output_duration = processed_frame_count / max(video_fps, 1)
-        preferred_codec = get_preferred_ffmpeg_video_codec()
-        codecs_to_try = [preferred_codec]
-        if preferred_codec != "libx264":
-            codecs_to_try.append("libx264")
-
-        last_error = None
-        for codec in codecs_to_try:
-            command = [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-i",
-                final_video_path,
-                "-i",
-                audio_path,
-                "-t",
-                f"{output_duration:.6f}",
-                *get_ffmpeg_video_encode_args(codec),
-                "-c:a",
-                "aac",
-                video_out_path,
-            ]
-            process = None
-            try:
-                throw_if_processing_interrupted()
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                while process.poll() is None:
-                    throw_if_processing_interrupted()
-                    time.sleep(0.1)
-                stdout, stderr = process.communicate()
-                if process.returncode == 0:
-                    if codec != preferred_codec:
-                        print(f"[Pililink] ffmpeg video encoder fallback succeeded with {codec}")
-                    last_error = None
-                    break
-
-                stderr_message = (stderr or stdout or "").strip()
-                if stderr_message:
-                    last_error = RuntimeError(
-                        f"ffmpeg failed with exit code {process.returncode} using {codec}: {stderr_message}"
-                    )
-                else:
-                    last_error = RuntimeError(f"ffmpeg failed with exit code {process.returncode} using {codec}")
-                if codec != "libx264":
-                    print(f"[Pililink] ffmpeg video encoder {codec} failed, retrying with libx264")
-                    continue
-                raise last_error
-            except Exception:
-                if process is not None and process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except Exception:
-                        process.kill()
-                raise
-
-        if last_error is not None:
-            raise last_error
+        _log_step(f"Starting audio mux (stream copy, duration={output_duration:.2f}s)")
+        throw_if_processing_interrupted()
+        _mux_t0 = time.time()
+        mux_video_audio_stream_copy(
+            final_video_path, audio_path, video_out_path, duration=output_duration
+        )
+        _log_step(f"Audio mux done ({time.time() - _mux_t0:.2f}s)")
+        _log_step(f"Pipeline complete | total {processed_frame_count} frames in {time.time() - _pipeline_t0:.2f}s")
