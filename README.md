@@ -86,6 +86,9 @@ latensync1.5/
 - `inference_steps`：推理步数
 - `vram_usage`：显存档位（high / medium / low）
 - `segment_inferences`：每段推理的 chunk 数（长视频建议 8~24）
+- `clip_batch_size`：每次送入运行时的 clip 批大小，显存紧张时可调小
+- `auto_oom_fallback`：显存不足时自动回退到更小的 clip 批大小
+- `quality_mode`：`balanced` / `quality_first`，后者更保守、速度通常更慢但更稳
 - `deepcache`：是否启用 DeepCache（CUDA 环境下推荐保持 `on`）
 - `deepcache_cache_interval`：DeepCache 刷新间隔，越大通常越快，但质量风险也更高
 - `deepcache_branch_id`：DeepCache 缓存分支，越小通常越激进
@@ -104,7 +107,7 @@ latensync1.5/
 - `deepcache`：是否启用 DeepCache（CUDA 环境下推荐保持 `on`）
 - `deepcache_cache_interval`：DeepCache 刷新间隔，默认 `3`
 - `deepcache_branch_id`：DeepCache 缓存分支，默认 `0`
-- `clip_batch_size`：每次送入 refactor 运行时的 clip 批大小，显存紧张时可调小
+- `clip_batch_size`：每次送入运行时的 clip 批大小，显存紧张时可调小
 - `auto_oom_fallback`：显存不足时自动回退到更小的 clip 批大小
 - `quality_mode`：`balanced` / `quality_first`，后者更保守、显存和速度通常更高但更稳
 - `mode`：时长对齐模式，支持 `normal` / `pingpong` / `loop_to_audio`
@@ -147,7 +150,7 @@ latensync1.5/
 
 - 输出：处理后视频帧 + 音频（ComfyUI 标准输出）
 - 路径版输出：返回 `audio`、`video_path`、`filename` 3 个输出，方便继续走文件路径链路
-- 兼容性：旧的 `Pililink LatentSync 1.5 (Video Path, Refactor Legacy)` 仍保留为兼容别名，推荐新建工作流时直接使用 `Pililink LatentSync 1.5 (Video Path)`
+- 兼容性：旧的 `Pililink LatentSync 1.5 (Refactor Legacy)` 和 `Pililink LatentSync 1.5 (Video Path, Refactor Legacy)` 仍保留为兼容别名，推荐新建工作流时直接使用 `Pililink LatentSync 1.5` / `Pililink LatentSync 1.5 (Video Path)`
 - 当 `result_mode=memory_only` 且未填写 `output_path` 时，结果文件只会暂存于临时目录，读取完成后自动清理；这时 `video_path` 和 `filename` 输出会为空字符串
 - 执行中可在 ComfyUI 中断（Stop）
 - 临时文件在节点运行目录下自动管理
