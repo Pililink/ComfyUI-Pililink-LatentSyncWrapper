@@ -67,7 +67,7 @@ NODE_DISPLAY_MAIN = "Pililink LatentSync 1.5"
 NODE_DISPLAY_ADJUSTER = "Pililink LatentSync Length Adjuster"
 NODE_DISPLAY_MAIN_PATH = "Pililink LatentSync 1.5 (Video Path)"
 NODE_DISPLAY_MAIN_REFACTOR = "Pililink LatentSync 1.5 (Refactor)"
-NODE_DISPLAY_MAIN_PATH_REFACTOR = "Pililink LatentSync 1.5 (Video Path, Refactor)"
+NODE_DISPLAY_MAIN_PATH_REFACTOR = "Pililink LatentSync 1.5 (Video Path, Refactor Legacy)"
 _FFMPEG_VIDEO_ENCODERS = None
 
 # Function to check for potential conflicts with other LatentSync implementations
@@ -932,74 +932,6 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
     return resolved_video_path, resolved_audio_path
 
 
-def build_vhs_video_info(video_path, images, info):
-    cap = cv2.VideoCapture(video_path)
-    try:
-        source_fps = float(cap.get(cv2.CAP_PROP_FPS) or info.get("video_fps") or 25.0)
-        source_frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    finally:
-        cap.release()
-
-    loaded_frame_count = int(images.shape[0]) if isinstance(images, torch.Tensor) and images.dim() >= 1 else 0
-    loaded_height = int(images.shape[1]) if loaded_frame_count > 0 else source_height
-    loaded_width = int(images.shape[2]) if loaded_frame_count > 0 else source_width
-
-    if source_frame_count <= 0:
-        source_frame_count = loaded_frame_count
-    if source_width <= 0:
-        source_width = loaded_width
-    if source_height <= 0:
-        source_height = loaded_height
-
-    source_duration = (
-        float(source_frame_count) / source_fps if source_fps > 0 and source_frame_count > 0 else 0.0
-    )
-    loaded_duration = (
-        float(loaded_frame_count) / source_fps if source_fps > 0 and loaded_frame_count > 0 else 0.0
-    )
-
-    return {
-        "source_fps": source_fps,
-        "source_frame_count": source_frame_count,
-        "source_duration": source_duration,
-        "source_width": source_width,
-        "source_height": source_height,
-        "loaded_fps": source_fps,
-        "loaded_frame_count": loaded_frame_count,
-        "loaded_duration": loaded_duration,
-        "loaded_width": loaded_width,
-        "loaded_height": loaded_height,
-    }
-
-
-def load_video_path_node_outputs(video_path):
-    if torchvision_io is None:
-        raise RuntimeError(
-            "torchvision.io is required to expose path-node video outputs as images/audio/video_info"
-        )
-
-    images, audio_frames, info = torchvision_io.read_video(video_path, pts_unit="sec")
-    images = (images.float() / 255.0).cpu()
-
-    audio_sample_rate = int(info.get("audio_fps") or 16000)
-    if audio_frames is None or audio_frames.numel() == 0:
-        waveform = torch.zeros((1, 1, 0), dtype=torch.float32)
-    else:
-        waveform = audio_frames.to(torch.float32).cpu()
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-        waveform = waveform.unsqueeze(0)
-
-    audio = {
-        "waveform": waveform,
-        "sample_rate": audio_sample_rate,
-    }
-    video_info = build_vhs_video_info(video_path, images, info)
-    return images, int(images.shape[0]), audio, video_info
-
-
 class PililinkLatentSyncBase:
     def __init__(self):
         # Make sure our temp directory is the current one
@@ -1021,6 +953,31 @@ class PililinkLatentSyncBase:
             aggressive = bool(execution_settings.get("aggressive_cuda_cache_clear", True))
         if aggressive:
             torch.cuda.empty_cache()
+
+    @staticmethod
+    def _load_audio_only(video_path):
+        """Load only the audio track from a video file via FFmpeg, without reading frames."""
+        temp_wav = video_path + ".audio_extract.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-nostdin",
+                 "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                 "-ar", "16000", "-ac", "1", temp_wav],
+                check=True,
+            )
+            import torchaudio
+            waveform, sr = torchaudio.load(temp_wav)
+            waveform = waveform.to(torch.float32).cpu().unsqueeze(0)
+            return {"waveform": waveform, "sample_rate": sr}
+        except Exception as e:
+            print(f"[Pililink] Audio extraction failed: {e}")
+            return {"waveform": torch.zeros((1, 1, 0), dtype=torch.float32), "sample_rate": 16000}
+        finally:
+            try:
+                if os.path.exists(temp_wav):
+                    os.remove(temp_wav)
+            except Exception:
+                pass
 
     def _prepare_execution_settings(self, inference_steps, vram_usage):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1456,7 +1413,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 3.0, "step": 0.1}),
                 "auto_silent_padding": ("BOOLEAN", {"default": False}),
-                "result_mode": (["memory_only", "both"], {"default": "memory_only"}),
+                "result_mode": (["both", "memory_only"], {"default": "both"}),
                 "filename_prefix": ("STRING", {"default": "LatentSync/Pililink"}),
             },
             "optional": {
@@ -1467,8 +1424,8 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
         }
 
     CATEGORY = NODE_CATEGORY
-    RETURN_TYPES = ("IMAGE", "INT", "AUDIO", "VHS_VIDEOINFO", "STRING", "STRING")
-    RETURN_NAMES = ("images", "frame_count", "audio", "video_info", "video_path", "filename")
+    RETURN_TYPES = ("AUDIO", "STRING", "STRING")
+    RETURN_NAMES = ("audio", "video_path", "filename")
     FUNCTION = "inference_from_path"
     OUTPUT_NODE = True
 
@@ -1557,18 +1514,18 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
 
             total_time = time.time() - start_time
             print(f"Pililink path-node total processing time: {total_time:.2f}s")
-            output_images, output_frame_count, output_audio, output_video_info = load_video_path_node_outputs(
-                final_output_path
-            )
+
+            # Release GPU memory before building output
+            self._maybe_cuda_empty_cache(execution_settings, force=True)
+
+            # Load only audio from the output video (no IMAGE tensor to avoid OOM)
+            output_audio = self._load_audio_only(final_output_path)
             returned_video_path = final_output_path if preserve_output_file else ""
             returned_filename = output_filename if preserve_output_file else ""
             return {
                 "ui": {"text": [returned_video_path or "[memory_only]"]},
                 "result": (
-                    output_images,
-                    output_frame_count,
                     output_audio,
-                    output_video_info,
                     returned_video_path,
                     returned_filename,
                 ),
@@ -2019,6 +1976,7 @@ class PililinkLatentSyncRefactorVideoPathNode(
     PililinkLatentSyncRefactorMixin,
     PililinkLatentSyncVideoPathNode,
 ):
+    CATEGORY = f"{NODE_CATEGORY}/Legacy"
     @classmethod
     def INPUT_TYPES(cls):
         input_types = copy.deepcopy(PililinkLatentSyncVideoPathNode.INPUT_TYPES())
@@ -2087,10 +2045,14 @@ class PililinkLatentSyncRefactorVideoPathNode(
         finally:
             self._pililink_refactor_runtime_options = None
 
+class PililinkLatentSyncUnifiedVideoPathNode(PililinkLatentSyncRefactorVideoPathNode):
+    CATEGORY = NODE_CATEGORY
+
+
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
     NODE_KEY_MAIN: PililinkLatentSyncNode,
-    NODE_KEY_MAIN_PATH: PililinkLatentSyncVideoPathNode,
+    NODE_KEY_MAIN_PATH: PililinkLatentSyncUnifiedVideoPathNode,
     NODE_KEY_MAIN_REFACTOR: PililinkLatentSyncRefactorNode,
     NODE_KEY_MAIN_PATH_REFACTOR: PililinkLatentSyncRefactorVideoPathNode,
     NODE_KEY_ADJUSTER: PililinkVideoLengthAdjuster,

@@ -1,7 +1,37 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cd \"E:\\\\comfyui-custom_nodes\\\\ComfyUI-Pililink-LatentSyncWrapper\" && python -c \"import ast; ast.parse\\(open\\('nodes.py'\\).read\\(\\)\\); print\\('nodes.py: OK'\\)\" && python -c \"import ast; ast.parse\\(open\\('latentsync/pipelines/lipsync_pipeline.py'\\).read\\(\\)\\); print\\('lipsync_pipeline.py: OK'\\)\")"
+      "Bash(cd \"E:\\\\comfyui-custom_nodes\\\\ComfyUI-Pililink-LatentSyncWrapper\" && python -c \"import ast; ast.parse\\(open\\('nodes.py'\\).read\\(\\)\\); print\\('nodes.py: OK'\\)\" && python -c \"import ast; ast.parse\\(open\\('latentsync/pipelines/lipsync_pipeline.py'\\).read\\(\\)\\); print\\('lipsync_pipeline.py: OK'\\)\")",
+      "Bash(test -f \"$HOME/.claude/CLAUDE.md\")",
+      "Bash(bash \"C:/Users/admin/.claude/plugins/marketplaces/omc/scripts/setup-claude-md.sh\" global)",
+      "Bash(bash \"C:/Users/admin/.claude/plugins/marketplaces/omc/scripts/setup-progress.sh\" clear)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''nodes.py'', doraise=True\\); print\\(''nodes.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''scripts/inference.py'', doraise=True\\); print\\(''scripts/inference.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''latentsync/utils/util.py'', doraise=True\\); print\\(''util.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''latentsync/pipelines/lipsync_pipeline.py'', doraise=True\\); print\\(''lipsync_pipeline.py OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''latentsync/pipelines/lipsync_pipeline.py'', doraise=True\\); print\\(''OK''\\)\")",
+      "Bash(dir /b)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''nodes.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
+      "Bash(bash \"C:/Users/admin/.claude/plugins/marketplaces/omc/scripts/setup-progress.sh\" resume)",
+      "Bash(bash \"C:/Users/admin/.claude/plugins/marketplaces/omc/scripts/setup-progress.sh\" save 2 global)",
+      "Bash(node:*)",
+      "Bash(bash \"C:/Users/admin/.claude/plugins/marketplaces/omc/scripts/setup-progress.sh\" save 4 \"global\")",
+      "Bash(bash \"C:/Users/admin/.claude/plugins/marketplaces/omc/scripts/setup-progress.sh\" save 6 \"global\")",
+      "Bash(claude mcp:*)",
+      "Bash(cmd /c npx -y @upstash/context7-mcp@latest --help)",
+      "Bash(cmd /c npx -y exa-mcp-server --help)",
+      "Bash(npx --version)",
+      "Bash(npm install:*)",
+      "Bash(timeout 5 npx -y @upstash/context7-mcp@latest)",
+      "Bash(timeout 5 npx -y exa-mcp-server)",
+      "Bash(where npx:*)",
+      "Bash(where node:*)",
+      "Read(//c/Program Files/nodejs/**)",
+      "Bash(ls \"C:/Users/admin/AppData/Roaming/npm/npx\"*)",
+      "Bash(omc --version)",
+      "Bash(python:*)",
+      "Bash(git:*)",
+      "mcp__plugin_oh-my-claudecode_t__ast_grep_search"
     ]
   }
 }

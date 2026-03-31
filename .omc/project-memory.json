@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1773417413740,
-  "projectRoot": "E:\\comfyui-custom_nodes\\ComfyUI-Pililink-LatentSyncWrapper",
+  "lastScanned": 1774841944944,
+  "projectRoot": "D:\\soulshell-comfyui-custom_nodes\\ComfyUI-Pililink-LatentSyncWrapper",
   "techStack": {
     "languages": [
       {
@@ -47,7 +47,7 @@
       "path": "configs",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1773417413718,
+      "lastAccessed": 1774841944927,
       "keyFiles": [
         "audio.yaml"
       ]
@@ -56,7 +56,7 @@
       "path": "eval",
       "purpose": null,
       "fileCount": 10,
-      "lastAccessed": 1773417413719,
+      "lastAccessed": 1774841944927,
       "keyFiles": [
         "draw_syncnet_lines.py",
         "eval_fvd.py",
@@ -69,14 +69,14 @@
       "path": "latentsync",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1773417413720,
+      "lastAccessed": 1774841944928,
       "keyFiles": []
     },
     "preprocess": {
       "path": "preprocess",
       "purpose": null,
       "fileCount": 10,
-      "lastAccessed": 1773417413720,
+      "lastAccessed": 1774841944928,
       "keyFiles": [
         "affine_transform.py",
         "data_processing_pipeline.py",
@@ -89,7 +89,7 @@
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 3,
-      "lastAccessed": 1773417413721,
+      "lastAccessed": 1774841944928,
       "keyFiles": [
         "inference.py",
         "train_syncnet.py",
@@ -100,7 +100,7 @@
       "path": "tools",
       "purpose": null,
       "fileCount": 8,
-      "lastAccessed": 1773417413721,
+      "lastAccessed": 1774841944928,
       "keyFiles": [
         "count_total_videos_time.py",
         "count_videos_time.py",
@@ -113,7 +113,7 @@
       "path": "workflows",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1773417413721,
+      "lastAccessed": 1774841944928,
       "keyFiles": [
         "Video_int_LipSync.json"
       ]
@@ -121,11 +121,13 @@
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 3,
-      "lastAccessed": 1773417413722,
+      "fileCount": 5,
+      "lastAccessed": 1774841944929,
       "keyFiles": [
         "latentsync_paths.cpython-311.pyc",
+        "nodes.cpython-310.pyc",
         "nodes.cpython-311.pyc",
+        "pililink_refactor_runtime.cpython-311.pyc",
         "__init__.cpython-311.pyc"
       ]
     },
@@ -133,7 +135,7 @@
       "path": "latentsync\\data",
       "purpose": "Data files",
       "fileCount": 2,
-      "lastAccessed": 1773417413723,
+      "lastAccessed": 1774841944930,
       "keyFiles": [
         "syncnet_dataset.py",
         "unet_dataset.py"
@@ -143,7 +145,7 @@
       "path": "latentsync\\models",
       "purpose": "Data models",
       "fileCount": 8,
-      "lastAccessed": 1773417413723,
+      "lastAccessed": 1774841944930,
       "keyFiles": [
         "attention.py",
         "motion_module.py",
@@ -154,7 +156,7 @@
       "path": "latentsync\\utils",
       "purpose": "Utility functions",
       "fileCount": 9,
-      "lastAccessed": 1773417413723,
+      "lastAccessed": 1774841944930,
       "keyFiles": [
         "affine_transform.py",
         "audio.py",
@@ -165,69 +167,75 @@
   "hotPaths": [
     {
       "path": "nodes.py",
-      "accessCount": 4,
-      "lastAccessed": 1773417678326,
-      "type": "file"
+      "accessCount": 67,
+      "lastAccessed": 1774870649274,
+      "type": "directory"
     },
     {
-      "path": "latentsync\\pipelines\\lipsync_pipeline.py",
-      "accessCount": 3,
-      "lastAccessed": 1773417678262,
-      "type": "file"
+      "path": "C:\\Users\\admin\\.claude.json",
+      "accessCount": 15,
+      "lastAccessed": 1774851842190,
+      "type": "directory"
     },
     {
       "path": "README.md",
-      "accessCount": 1,
-      "lastAccessed": 1773417429866,
+      "accessCount": 11,
+      "lastAccessed": 1774870600399,
+      "type": "directory"
+    },
+    {
+      "path": "",
+      "accessCount": 10,
+      "lastAccessed": 1774870649374,
+      "type": "directory"
+    },
+    {
+      "path": "C:\\Users\\admin\\.claude\\settings.json",
+      "accessCount": 2,
+      "lastAccessed": 1774850463283,
       "type": "file"
     },
     {
-      "path": "__init__.py",
+      "path": "C:\\Users\\admin\\.claude\\plugins\\marketplaces\\omc\\skills\\omc-setup\\phases\\01-install-claude-md.md",
       "accessCount": 1,
-      "lastAccessed": 1773417429880,
+      "lastAccessed": 1774842042865,
       "type": "file"
     },
     {
-      "path": "requirements.txt",
+      "path": "C:\\Users\\admin\\.claude\\plugins\\marketplaces\\omc\\skills\\omc-setup\\phases\\02-configure.md",
       "accessCount": 1,
-      "lastAccessed": 1773417447277,
+      "lastAccessed": 1774842160440,
       "type": "file"
     },
     {
-      "path": "latentsync_paths.py",
+      "path": "C:\\Users\\admin\\.claude\\hud\\omc-hud.mjs",
       "accessCount": 1,
-      "lastAccessed": 1773417447388,
+      "lastAccessed": 1774842456184,
       "type": "file"
     },
     {
-      "path": "configs\\unet\\stage2.yaml",
+      "path": "C:\\Users\\admin\\.claude\\plugins\\marketplaces\\omc\\skills\\omc-setup\\phases\\03-integrations.md",
       "accessCount": 1,
-      "lastAccessed": 1773417461786,
+      "lastAccessed": 1774850767561,
       "type": "file"
     },
     {
-      "path": "scripts\\inference.py",
+      "path": "C:\\Users\\admin\\.claude\\plugins\\marketplaces\\omc\\skills\\omc-setup\\phases\\04-welcome.md",
       "accessCount": 1,
-      "lastAccessed": 1773417461870,
+      "lastAccessed": 1774851873453,
       "type": "file"
     },
     {
-      "path": "CLAUDE.md",
+      "path": "pililink_refactor_runtime.py",
       "accessCount": 1,
-      "lastAccessed": 1773417505809,
-      "type": "file"
+      "lastAccessed": 1774864852220,
+      "type": "directory"
     },
     {
-      "path": "latentsync\\utils\\image_processor.py",
+      "path": "latentsync\\pipelines\\lipsync_pipeline.py",
       "accessCount": 1,
-      "lastAccessed": 1773417561504,
-      "type": "file"
-    },
-    {
-      "path": "latentsync\\utils\\affine_transform.py",
-      "accessCount": 1,
-      "lastAccessed": 1773417561571,
-      "type": "file"
+      "lastAccessed": 1774864983957,
+      "type": "directory"
     }
   ],
   "userDirectives": []
