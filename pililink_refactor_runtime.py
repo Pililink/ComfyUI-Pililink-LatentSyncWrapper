@@ -28,6 +28,21 @@ def throw_if_processing_interrupted():
         comfy_model_management.throw_exception_if_processing_interrupted()
 
 
+def _report_progress(progress_callback, stage, fraction):
+    if progress_callback is None:
+        return
+
+    try:
+        fraction = max(0.0, min(1.0, float(fraction)))
+    except Exception:
+        fraction = 0.0
+
+    try:
+        progress_callback(stage, fraction)
+    except Exception:
+        pass
+
+
 _RUNTIME_CACHE = {}
 _RUNTIME_CACHE_LOCK = threading.Lock()
 
@@ -129,6 +144,37 @@ def _build_clip_batch_candidates(requested_batch_size, auto_oom_fallback):
     return candidates
 
 
+def _build_segment_inference_candidates(requested_segment_inferences, auto_oom_fallback):
+    requested_segment_inferences = max(2, int(requested_segment_inferences))
+    if not auto_oom_fallback or requested_segment_inferences == 2:
+        return [requested_segment_inferences]
+
+    candidates = [requested_segment_inferences]
+    current = requested_segment_inferences
+    while current > 2:
+        current = max(2, current // 2)
+        if current not in candidates:
+            candidates.append(current)
+    return candidates
+
+
+def _build_execution_candidates(requested_segment_inferences, requested_batch_size, auto_oom_fallback):
+    segment_candidates = _build_segment_inference_candidates(requested_segment_inferences, auto_oom_fallback)
+    clip_candidates = _build_clip_batch_candidates(requested_batch_size, auto_oom_fallback)
+    execution_candidates = []
+    seen = set()
+
+    for current_segment_inferences in segment_candidates:
+        for current_clip_batch_size in clip_candidates:
+            candidate = (current_segment_inferences, current_clip_batch_size)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            execution_candidates.append(candidate)
+
+    return execution_candidates
+
+
 class _RefactorRuntime:
     def __init__(
         self,
@@ -142,11 +188,14 @@ class _RefactorRuntime:
         vae_model_path,
         device_str,
         dtype,
+        progress_callback=None,
     ):
         throw_if_processing_interrupted()
 
+        _report_progress(progress_callback, "Loading scheduler", 0.02)
         scheduler = _load_scheduler(scheduler_path, scheduler_type=scheduler_type)
 
+        _report_progress(progress_callback, "Loading Whisper encoder", 0.04)
         audio_encoder = Audio2Feature(
             model_path=whisper_model_path,
             device=device_str,
@@ -157,6 +206,7 @@ class _RefactorRuntime:
         audio_encoder.model.requires_grad_(False)
         audio_encoder.model.eval()
 
+        _report_progress(progress_callback, "Loading VAE", 0.06)
         resolved_vae_model_path = vae_model_path if os.path.exists(vae_model_path) else "stabilityai/sd-vae-ft-mse"
         vae = AutoencoderKL.from_pretrained(resolved_vae_model_path, torch_dtype=dtype)
         vae.config.scaling_factor = 0.18215
@@ -164,6 +214,7 @@ class _RefactorRuntime:
         vae.requires_grad_(False)
         vae.eval()
 
+        _report_progress(progress_callback, "Loading UNet", 0.08)
         denoising_unet, _ = UNet3DConditionModel.from_pretrained(
             OmegaConf.to_container(config.model),
             inference_ckpt_path,
@@ -179,6 +230,7 @@ class _RefactorRuntime:
             denoising_unet=denoising_unet,
             scheduler=scheduler,
         ).to(device_str)
+        _report_progress(progress_callback, "Models ready", 0.10)
 
         self.config = config
         self.device_str = device_str
@@ -206,11 +258,12 @@ class _RefactorRuntime:
         clip_batch_size,
         auto_oom_fallback,
         quality_mode,
-        segment_overlap_clips,
         affine_detect_interval,
+        progress_callback=None,
     ):
         with self.run_lock:
             throw_if_processing_interrupted()
+            _report_progress(progress_callback, "Preparing inference", 0.12)
 
             if seed != -1:
                 set_seed(seed)
@@ -222,12 +275,14 @@ class _RefactorRuntime:
                 resolved_quality_mode = "balanced"
 
             target_clip_batch_size = max(1, int(clip_batch_size))
+            target_segment_inferences = max(2, int(segment_inferences))
             target_deepcache = deepcache
             if resolved_quality_mode == "quality_first":
                 target_clip_batch_size = 1
                 target_deepcache = "off"
 
-            clip_batch_candidates = _build_clip_batch_candidates(
+            execution_candidates = _build_execution_candidates(
+                target_segment_inferences,
                 target_clip_batch_size,
                 bool(auto_oom_fallback),
             )
@@ -236,7 +291,7 @@ class _RefactorRuntime:
                 f"device={self.device_str}",
                 f"dtype={self.dtype}",
                 f"quality_mode={resolved_quality_mode}",
-                f"clip_batch_candidates={clip_batch_candidates}",
+                f"execution_candidates={execution_candidates}",
                 f"affine_detect_interval={max(1, int(affine_detect_interval))}",
             )
 
@@ -254,9 +309,15 @@ class _RefactorRuntime:
                         torch.backends.cudnn.allow_tf32 = False
 
                 last_exc = None
-                for candidate_index, current_clip_batch_size in enumerate(clip_batch_candidates):
+                for candidate_index, (current_segment_inferences, current_clip_batch_size) in enumerate(execution_candidates):
                     deepcache_helper = None
                     try:
+                        if candidate_index > 0:
+                            print(
+                                "Pililink refactor runtime retry:",
+                                f"segment_inferences={current_segment_inferences}",
+                                f"clip_batch_size={current_clip_batch_size}",
+                            )
                         deepcache_helper = _maybe_enable_deepcache(
                             self.pipeline,
                             target_deepcache,
@@ -277,7 +338,7 @@ class _RefactorRuntime:
                                 weight_dtype=self.dtype,
                                 width=self.config.data.resolution,
                                 height=self.config.data.resolution,
-                                segment_inferences=segment_inferences,
+                                segment_inferences=current_segment_inferences,
                                 temp_dir=temp_dir,
                                 mask_image_path=mask_image_path,
                                 skip_video_normalization=bool(skip_video_normalization),
@@ -285,14 +346,21 @@ class _RefactorRuntime:
                                     resolved_quality_mode == "quality_first" or current_clip_batch_size <= 1
                                 ),
                                 clip_batch_size=current_clip_batch_size,
-                                segment_overlap_clips=max(0, int(segment_overlap_clips)),
                                 affine_detect_interval=max(1, int(affine_detect_interval)),
+                                progress_callback=progress_callback,
                             )
                         return
                     except Exception as exc:
                         last_exc = exc
-                        has_next_candidate = candidate_index < len(clip_batch_candidates) - 1
+                        has_next_candidate = candidate_index < len(execution_candidates) - 1
                         if has_next_candidate and _is_cuda_oom_error(exc):
+                            _report_progress(progress_callback, "Retrying with smaller batch", 0.12)
+                            print(
+                                "Pililink refactor runtime OOM:",
+                                f"segment_inferences={current_segment_inferences}",
+                                f"clip_batch_size={current_clip_batch_size}",
+                                "-> trying a smaller execution candidate",
+                            )
                             if torch.cuda.is_available():
                                 torch.cuda.empty_cache()
                             continue
@@ -343,10 +411,11 @@ def run_refactor_inference(
     clip_batch_size,
     auto_oom_fallback,
     quality_mode,
-    segment_overlap_clips,
     affine_detect_interval,
+    progress_callback=None,
 ):
     throw_if_processing_interrupted()
+    _report_progress(progress_callback, "Loading config", 0.01)
 
     config = OmegaConf.load(config_path)
     whisper_model_path = _resolve_whisper_path(latentsync_root, config)
@@ -380,8 +449,11 @@ def run_refactor_inference(
                 vae_model_path=vae_model_path,
                 device_str=device_str,
                 dtype=dtype,
+                progress_callback=progress_callback,
             )
             _RUNTIME_CACHE[cache_key] = runtime
+        else:
+            _report_progress(progress_callback, "Reusing loaded models", 0.10)
 
     runtime.run(
         video_path=video_path,
@@ -400,6 +472,6 @@ def run_refactor_inference(
         clip_batch_size=clip_batch_size,
         auto_oom_fallback=auto_oom_fallback,
         quality_mode=quality_mode,
-        segment_overlap_clips=segment_overlap_clips,
         affine_detect_interval=affine_detect_interval,
+        progress_callback=progress_callback,
     )

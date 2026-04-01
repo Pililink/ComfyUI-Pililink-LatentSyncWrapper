@@ -34,7 +34,7 @@ def load_fixed_mask(resolution: int, mask_image_path="latentsync/utils/mask.png"
     mask_image = cv2.imread(mask_image_path)
     mask_image = cv2.cvtColor(mask_image, cv2.COLOR_BGR2RGB)
     mask_image = cv2.resize(mask_image, (resolution, resolution), interpolation=cv2.INTER_LANCZOS4) / 255.0
-    mask_image = rearrange(torch.from_numpy(mask_image), "h w c -> c h w")
+    mask_image = rearrange(torch.from_numpy(mask_image).to(dtype=torch.float32), "h w c -> c h w")
     return mask_image
 
 
@@ -62,7 +62,9 @@ class ImageProcessor:
             if mask_image is None:
                 self.mask_image = load_fixed_mask(resolution)
             else:
-                self.mask_image = mask_image
+                self.mask_image = mask_image.to(dtype=torch.float32)
+
+            self.mask_image = self.mask_image.to(device=self.torch_device, dtype=torch.float32)
 
             if self.device_str != "cpu":
                 self.fa = face_alignment.FaceAlignment(
@@ -179,7 +181,7 @@ class ImageProcessor:
                 align_corners=False,
             )
 
-        face = sampled.squeeze(0).clamp(0.0, 255.0).round().to(torch.uint8).cpu()
+        face = sampled.squeeze(0).clamp(0.0, 255.0).round().to(torch.uint8)
         return face
 
     def warp_face_with_affine_matrix(self, image: np.ndarray, affine_matrix: np.ndarray):
@@ -260,17 +262,42 @@ class ImageProcessor:
             image, _, _ = self.affine_transform(image)
         else:
             image = self.resize(image)
+        image = image.to(device=self.torch_device, dtype=torch.float32)
         pixel_values = self.normalize(image / 255.0)
-        masked_pixel_values = pixel_values * self.mask_image
-        return pixel_values, masked_pixel_values, self.mask_image[0:1]
+        mask_image = self.mask_image.to(device=pixel_values.device, dtype=pixel_values.dtype)
+        masked_pixel_values = pixel_values * mask_image
+        return pixel_values, masked_pixel_values, mask_image[0:1]
 
-    def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False):
+    @staticmethod
+    def _ensure_nchw_tensor(images: Union[torch.Tensor, np.ndarray]):
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(images)
-        if images.shape[3] == 3:
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+        if images.dim() == 4 and images.shape[-1] == 3:
             images = rearrange(images, "f h w c -> f c h w")
+        return images
+
+    def _prepare_fixed_mask_batch(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False):
+        images = self._ensure_nchw_tensor(images)
+
+        if affine_transform:
+            results = [self.preprocess_fixed_mask_image(image, affine_transform=True) for image in images]
+            pixel_values_list, masked_pixel_values_list, masks_list = list(zip(*results))
+            return torch.stack(pixel_values_list), torch.stack(masked_pixel_values_list), torch.stack(masks_list)
+
+        images = images.to(device=self.torch_device, dtype=torch.float32)
+        images = self.resize(images)
+        pixel_values = (images / 255.0 - 0.5) / 0.5
+        mask_image = self.mask_image.to(device=pixel_values.device, dtype=pixel_values.dtype)
+        masked_pixel_values = pixel_values * mask_image.unsqueeze(0)
+        masks = mask_image[0:1].unsqueeze(0).expand(pixel_values.shape[0], -1, -1, -1)
+        return pixel_values, masked_pixel_values, masks
+
+    def prepare_masks_and_masked_images(self, images: Union[torch.Tensor, np.ndarray], affine_transform=False):
+        images = self._ensure_nchw_tensor(images)
         if self.mask == "fix_mask":
-            results = [self.preprocess_fixed_mask_image(image, affine_transform=affine_transform) for image in images]
+            return self._prepare_fixed_mask_batch(images, affine_transform=affine_transform)
         else:
             results = [self.preprocess_one_masked_image(image) for image in images]
 

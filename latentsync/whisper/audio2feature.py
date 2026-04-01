@@ -103,6 +103,31 @@ class Audio2Feature:
 
         return whisper_chunks
 
+    def count_feature_frames(self, feature_array, fps):
+        whisper_idx_multiplier = 50.0 / fps
+        frame_count = 0
+        feature_length = len(feature_array)
+
+        while True:
+            start_idx = int(frame_count * whisper_idx_multiplier)
+            frame_count += 1
+            if start_idx > feature_length:
+                return frame_count
+
+    def get_feature_window(self, feature_array, vid_idx, fps=25):
+        selected_feature, _ = self.get_sliced_feature(feature_array=feature_array, vid_idx=vid_idx, fps=fps)
+        return selected_feature
+
+    def get_feature_windows_batch(self, feature_array, start_frame, frame_count, fps=25):
+        windows = []
+        for vid_idx in range(start_frame, start_frame + frame_count):
+            windows.append(self.get_feature_window(feature_array, vid_idx, fps=fps))
+
+        if not windows:
+            return torch.empty((0, 0, self.embedding_dim), dtype=feature_array.dtype, device=feature_array.device)
+
+        return torch.stack(windows, dim=0)
+
     def _audio2feat(self, audio_path: str):
         # get the sample rate of the audio
         result = self.model.transcribe(audio_path)

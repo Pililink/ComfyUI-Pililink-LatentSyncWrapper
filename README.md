@@ -102,23 +102,24 @@ latensync1.5/
 ## 节点参数说明（路径版节点）
 
 - `video_path`：本地视频绝对路径
-- `audio`：可选，ComfyUI 音频输入
-- `audio_path`：可选，本地音频绝对路径；填写后优先于 `audio`
+- `seed` / `lips_expression` / `inference_steps` / `vram_usage` / `segment_inferences`：与主节点一致
+- `clip_batch_size`：每次送入运行时的 clip 批大小，显存紧张时可调小
+- `auto_oom_fallback`：显存不足时自动回退到更小的 clip 批大小
+- `quality_mode`：`balanced` / `quality_first`，后者更保守、速度通常更慢但更稳
 - `deepcache`：是否启用 DeepCache（CUDA 环境下推荐保持 `on`）
 - `deepcache_cache_interval`：DeepCache 刷新间隔，默认 `3`
 - `deepcache_branch_id`：DeepCache 缓存分支，默认 `0`
-- `clip_batch_size`：每次送入运行时的 clip 批大小，显存紧张时可调小
-- `auto_oom_fallback`：显存不足时自动回退到更小的 clip 批大小
-- `quality_mode`：`balanced` / `quality_first`，后者更保守、显存和速度通常更高但更稳
+- `scheduler_type`：`ddim` / `dpm_solver`
+- `affine_detect_interval`：隔多少帧重新做人脸仿射检测，默认 `1`
 - `mode`：时长对齐模式，支持 `normal` / `pingpong` / `loop_to_audio`
 - `silent_padding_sec`：补齐音频时附加的静音秒数
-- `auto_silent_padding`：自动根据视频和音频时长差计算静音补齐时长；例如视频 50s、音频 10s 时，会自动补约 40s 静音
-- `result_mode`：结果输出模式，`memory_only` 表示仅把结果交给后续节点并自动清理过程文件，`both` 表示同时保留输出 mp4 文件
+- `auto_silent_padding`：自动根据视频和音频时长差计算静音补齐时长
 - `filename_prefix`：输出到 ComfyUI `output` 目录时使用的前缀
+- `audio`：可选，ComfyUI 音频输入
+- `audio_path`：可选，本地音频绝对路径；填写后优先于 `audio`
 - `output_path`：可选，直接指定最终输出 mp4 的绝对路径
-- `seed` / `lips_expression` / `inference_steps` / `vram_usage` / `segment_inferences`：与主节点一致
 
-路径版节点会直接读取源视频路径并输出保存后的 mp4 路径和音频，不返回 `IMAGE` tensor，因此不受视频长度限制，适合长视频处理。`result_mode` 默认 `both`，输出文件会保存到 ComfyUI 的 `output` 目录。
+路径版节点会直接读取源视频路径并输出保存后的 mp4 路径和音频，不返回 `IMAGE` tensor，因此不受视频长度限制，适合长视频处理。默认会保留输出文件到 ComfyUI 的 `output` 目录。
 
 如果 `audio` 和 `audio_path` 都留空，节点会自动尝试提取输入视频自带音轨作为驱动音频。
 
@@ -150,8 +151,7 @@ latensync1.5/
 
 - 输出：处理后视频帧 + 音频（ComfyUI 标准输出）
 - 路径版输出：返回 `audio`、`video_path`、`filename` 3 个输出，方便继续走文件路径链路
-- 兼容性：旧的 `Pililink LatentSync 1.5 (Refactor Legacy)` 和 `Pililink LatentSync 1.5 (Video Path, Refactor Legacy)` 仍保留为兼容别名，推荐新建工作流时直接使用 `Pililink LatentSync 1.5` / `Pililink LatentSync 1.5 (Video Path)`
-- 当 `result_mode=memory_only` 且未填写 `output_path` 时，结果文件只会暂存于临时目录，读取完成后自动清理；这时 `video_path` 和 `filename` 输出会为空字符串
+- 路径版节点当前总是保留输出文件，并返回有效的 `video_path` 和 `filename`
 - 执行中可在 ComfyUI 中断（Stop）
 - 临时文件在节点运行目录下自动管理
 

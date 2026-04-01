@@ -1,5 +1,4 @@
 import atexit
-import copy
 import importlib.util
 import math
 import os
@@ -9,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import uuid
@@ -19,8 +19,6 @@ import requests
 import torch
 import torchaudio
 
-# Global model cache to avoid reloading models - Using unique name to avoid conflicts
-_PILILINK_MODEL_CACHE = {}
 REQUIRED_PACKAGES = [
     "omegaconf",
     "transformers",
@@ -32,6 +30,18 @@ REQUIRED_PACKAGES = [
 ]
 
 folder_paths = __import__("folder_paths")
+
+comfy_utils = None
+try:
+    comfy_utils = __import__("comfy.utils", fromlist=["ProgressBar"])
+except Exception:
+    comfy_utils = None
+
+PromptServer = None
+try:
+    from server import PromptServer
+except Exception:
+    PromptServer = None
 
 try:
     import torchvision.io as torchvision_io
@@ -53,20 +63,117 @@ except Exception:
 _LATENTSYNC_PATHS = initialize_latentsync_paths()
 LATENTSYNC_ROOT_DIR = _LATENTSYNC_PATHS["root"]
 HF_CACHE_DIR = _LATENTSYNC_PATHS["hf_cache_dir"]
-TORCH_CACHE_DIR = _LATENTSYNC_PATHS["torch_cache_dir"]
 
 NODE_CATEGORY = "PililinkLatentSync"
 NODE_KEY_MAIN = "PililinkLatentSyncNode"
 NODE_KEY_ADJUSTER = "PililinkLatentSyncLengthAdjuster"
 NODE_KEY_MAIN_PATH = "PililinkLatentSyncVideoPathNode"
-NODE_KEY_MAIN_REFACTOR = "PililinkLatentSyncRefactorNode"
-NODE_KEY_MAIN_PATH_REFACTOR = "PililinkLatentSyncRefactorVideoPathNode"
 NODE_DISPLAY_MAIN = "Pililink LatentSync 1.5"
 NODE_DISPLAY_ADJUSTER = "Pililink LatentSync Length Adjuster"
 NODE_DISPLAY_MAIN_PATH = "Pililink LatentSync 1.5 (Video Path)"
-NODE_DISPLAY_MAIN_REFACTOR = "Pililink LatentSync 1.5 (Refactor Legacy)"
-NODE_DISPLAY_MAIN_PATH_REFACTOR = "Pililink LatentSync 1.5 (Video Path, Refactor Legacy)"
 _FFMPEG_VIDEO_ENCODERS = None
+_RUNTIME_SETUP_DONE = False
+_RUNTIME_SETUP_LOCK = threading.Lock()
+
+PATH_NODE_DEFAULTS = {
+    "seed": 1247,
+    "lips_expression": 1.5,
+    "inference_steps": 20,
+    "vram_usage": "medium",
+    "segment_inferences": 8,
+    "clip_batch_size": 1,
+    "auto_oom_fallback": True,
+    "quality_mode": "balanced",
+    "deepcache": "on",
+    "deepcache_cache_interval": 3,
+    "deepcache_branch_id": 0,
+    "scheduler_type": "ddim",
+    "affine_detect_interval": 1,
+    "mode": "normal",
+    "silent_padding_sec": 0.5,
+    "auto_silent_padding": False,
+    "filename_prefix": "LatentSync/Pililink",
+}
+
+
+def _clamp_progress_fraction(value):
+    try:
+        value = float(value)
+    except Exception:
+        return 0.0
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
+
+
+class PililinkProgressReporter:
+    def __init__(self, *, total=1000, node_id=None):
+        self.total = max(1, int(total))
+        self.node_id = str(node_id) if node_id is not None else None
+        self.current = 0
+        self.last_stage = None
+        self.progress_bar = None
+        if comfy_utils is not None and hasattr(comfy_utils, "ProgressBar"):
+            try:
+                self.progress_bar = comfy_utils.ProgressBar(self.total)
+            except Exception:
+                self.progress_bar = None
+
+    def _send_stage_message(self, stage):
+        if (
+            not stage
+            or stage == self.last_stage
+            or PromptServer is None
+            or getattr(PromptServer, "instance", None) is None
+            or self.node_id is None
+        ):
+            if stage:
+                self.last_stage = stage
+            return
+
+        try:
+            PromptServer.instance.send_sync(
+                "pililink.progress.stage",
+                {
+                    "node": self.node_id,
+                    "stage": stage,
+                    "value": self.current,
+                    "max": self.total,
+                },
+            )
+        except Exception:
+            pass
+        self.last_stage = stage
+
+    def update_fraction(self, fraction, stage=None, allow_decrease=False):
+        fraction = _clamp_progress_fraction(fraction)
+        value = int(round(fraction * self.total))
+        if not allow_decrease:
+            value = max(self.current, value)
+        value = min(self.total, value)
+        self.current = value
+
+        if self.progress_bar is not None:
+            try:
+                self.progress_bar.update_absolute(self.current, self.total)
+            except Exception:
+                pass
+
+        self._send_stage_message(stage)
+
+    def update_stage_fraction(self, start_fraction, end_fraction, fraction, stage=None):
+        start_fraction = _clamp_progress_fraction(start_fraction)
+        end_fraction = max(start_fraction, _clamp_progress_fraction(end_fraction))
+        mapped_fraction = start_fraction + (end_fraction - start_fraction) * _clamp_progress_fraction(fraction)
+        self.update_fraction(mapped_fraction, stage=stage)
+
+    def make_stage_callback(self, start_fraction, end_fraction):
+        def _callback(stage, fraction):
+            self.update_stage_fraction(start_fraction, end_fraction, fraction, stage=stage)
+
+        return _callback
 
 # Function to check for potential conflicts with other LatentSync implementations
 def check_for_conflicts():
@@ -81,10 +188,6 @@ def check_for_conflicts():
     except:
         pass
     return False
-
-def get_unique_temp_path(suffix=""):
-    return os.path.join(get_comfy_temp_root(), f"pilkilink_latentsync_{uuid.uuid4().hex[:8]}{suffix}")
-
 
 def _normalize_str_path(value):
     if isinstance(value, str):
@@ -140,10 +243,7 @@ def init_temp_directories():
 # Function to clean up everything when the module exits
 def module_cleanup():
     """Clean up all resources when the module is unloaded"""
-    global MODULE_TEMP_DIR, _PILILINK_MODEL_CACHE
-    
-    # Clear model cache references to free memory
-    _PILILINK_MODEL_CACHE.clear()
+    global MODULE_TEMP_DIR
     
     # Clean up temp directory (node-local session directory)
     if MODULE_TEMP_DIR and os.path.exists(MODULE_TEMP_DIR):
@@ -153,6 +253,24 @@ def module_cleanup():
         except:
             pass
 
+
+def ensure_runtime_ready():
+    global MODULE_TEMP_DIR, _RUNTIME_SETUP_DONE
+
+    if _RUNTIME_SETUP_DONE:
+        return
+
+    with _RUNTIME_SETUP_LOCK:
+        if _RUNTIME_SETUP_DONE:
+            return
+
+        if not os.path.exists(MODULE_TEMP_DIR):
+            os.makedirs(MODULE_TEMP_DIR, exist_ok=True)
+
+        check_and_install_dependencies()
+        setup_models()
+        _RUNTIME_SETUP_DONE = True
+
 # Call this before anything else
 MODULE_TEMP_DIR = init_temp_directories()
 
@@ -160,7 +278,7 @@ MODULE_TEMP_DIR = init_temp_directories()
 atexit.register(module_cleanup)
 
 # Check for conflicts with other implementations
-conflict_detected = check_for_conflicts()
+check_for_conflicts()
 
 comfy_model_management = None
 try:
@@ -174,42 +292,9 @@ def throw_if_processing_interrupted():
         comfy_model_management.throw_exception_if_processing_interrupted()
 
 
-def get_latentsync_root_dir(mkdir=True):
-    """Return unified model root: ComfyUI/models/latensync1.5 (with legacy compatibility)."""
-    root = LATENTSYNC_ROOT_DIR
-    if mkdir:
-        os.makedirs(root, exist_ok=True)
-    return root
-
-
 def get_latentsync_path(*parts, mkdir_parent=False):
     """Build path under active ComfyUI/models/latensync1.5 root."""
     return build_latentsync_path(LATENTSYNC_ROOT_DIR, *parts, mkdir_parent=mkdir_parent)
-
-
-def get_cached_model(model_path, model_type, device):
-    global _PILILINK_MODEL_CACHE
-    cache_key = f"pililink_{model_type}_{model_path}"
-    
-    if cache_key in _PILILINK_MODEL_CACHE:
-        # Check if the cached model is on the right device
-        cached_model = _PILILINK_MODEL_CACHE[cache_key]
-        model_device = next(cached_model.parameters()).device
-        if str(model_device) == str(device):
-            print(f"Using cached {model_type} model from Pililink cache")
-            return cached_model
-        else:
-            print(f"Moving cached {model_type} model to {device}")
-            cached_model = cached_model.to(device)
-            return cached_model
-    
-    print(f"Loading {model_type} model from disk into Pililink cache")
-    # Load the model
-    model = torch.load(model_path, map_location=device)
-    
-    # Cache the model
-    _PILILINK_MODEL_CACHE[cache_key] = model
-    return model
 
 def import_refactor_runtime_module():
     try:
@@ -312,32 +397,6 @@ def is_probably_25fps_video(video_path):
     except Exception:
         return False
 
-
-def normalize_path(path):
-    """Normalize path to handle spaces and special characters"""
-    return os.path.normpath(path).replace('\\', '/')
-
-def get_ext_dir(subpath=None, mkdir=False):
-    """Get extension directory path, optionally with a subpath"""
-    # Get the directory containing this script
-    dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Special case for temp directories
-    if subpath and ("temp" in subpath.lower() or "tmp" in subpath.lower()):
-        # Use our global temp directory instead
-        global MODULE_TEMP_DIR
-        sub_temp = os.path.join(MODULE_TEMP_DIR, subpath)
-        if mkdir and not os.path.exists(sub_temp):
-            os.makedirs(sub_temp, exist_ok=True)
-        return sub_temp
-    
-    if subpath is not None:
-        dir = os.path.join(dir, subpath)
-
-    if mkdir and not os.path.exists(dir):
-        os.makedirs(dir, exist_ok=True)
-    
-    return dir
 
 def download_model(url, save_path):
     """Download a model from a URL and save it to the specified path."""
@@ -524,24 +583,6 @@ def get_output_video_path(filename_prefix, output_path=""):
     os.makedirs(full_output_folder, exist_ok=True)
     output_filename = f"{filename}_{counter:05d}.mp4"
     return os.path.join(full_output_folder, output_filename), output_filename
-
-
-def resolve_path_node_output_target(filename_prefix, output_path, result_mode, temp_dir, run_id):
-    output_path_text = str(output_path or "").strip().strip('"').strip("'")
-    resolved_mode = str(result_mode or "memory_only").lower()
-    if resolved_mode not in {"memory_only", "both"}:
-        raise ValueError(f"Pililink: unsupported result mode: {result_mode}")
-
-    if output_path_text:
-        final_output_path, output_filename = get_output_video_path(filename_prefix, output_path_text)
-        return final_output_path, output_filename, True
-
-    if resolved_mode == "both":
-        final_output_path, output_filename = get_output_video_path(filename_prefix, "")
-        return final_output_path, output_filename, True
-
-    final_output_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_result.mp4")
-    return final_output_path, os.path.basename(final_output_path), False
 
 
 def save_audio_input(audio, target_audio_path):
@@ -827,13 +868,10 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
 
     if resolved_mode == "normal":
         target_duration = min(video_duration, audio_duration + effective_padding_sec)
-        if target_duration < video_duration - duration_epsilon:
-            resolved_video_path = trim_video_to_duration(
-                video_path,
-                build_temp_path("pililink_length_normal_video.mp4"),
-                target_duration,
-            )
-        if needs_adjustment(audio_duration, target_duration):
+        # The pipeline already aligns output length to the shortest valid stream,
+        # so avoid an eager FFmpeg trim in normal mode unless the user explicitly
+        # asked for additional silence padding.
+        if effective_padding_sec > duration_epsilon and needs_adjustment(audio_duration, target_duration):
             resolved_audio_path = adjust_audio_duration(
                 audio_path,
                 build_temp_path("pililink_length_normal_audio.wav"),
@@ -905,9 +943,6 @@ class PililinkLatentSyncBase:
         global MODULE_TEMP_DIR
         if not os.path.exists(MODULE_TEMP_DIR):
             os.makedirs(MODULE_TEMP_DIR, exist_ok=True)
-        
-        check_and_install_dependencies()
-        setup_models()
 
     def _maybe_cuda_empty_cache(self, execution_settings=None, force=False):
         if not torch.cuda.is_available():
@@ -1005,6 +1040,49 @@ class PililinkLatentSyncBase:
             return alt_mask_path
         return default_mask_path
 
+    @staticmethod
+    def _write_temp_video_with_progress(frames_cpu, target_path, fps, progress=None, start_fraction=0.0, end_fraction=1.0):
+        global av_mod
+
+        if torchvision_io is not None:
+            try:
+                torchvision_io.write_video(target_path, frames_cpu, fps=fps, video_codec="h264")
+                if progress is not None:
+                    progress.update_fraction(end_fraction, stage="Temporary video ready")
+                return
+            except (TypeError, RuntimeError, ValueError, AttributeError):
+                pass
+
+        if av_mod is None:
+            av_mod = __import__("av")
+
+        container = av_mod.open(target_path, mode="w")
+        try:
+            stream = container.add_stream("h264", rate=fps)
+            stream.width = frames_cpu.shape[2]
+            stream.height = frames_cpu.shape[1]
+
+            total_frames = int(frames_cpu.shape[0])
+            for frame_index, frame in enumerate(frames_cpu):
+                throw_if_processing_interrupted()
+                video_frame = av_mod.VideoFrame.from_ndarray(frame.numpy(), format="rgb24")
+                packet = stream.encode(video_frame)
+                container.mux(packet)
+
+                if progress is not None and total_frames > 0:
+                    if frame_index + 1 == total_frames or ((frame_index + 1) % 8 == 0):
+                        progress.update_stage_fraction(
+                            start_fraction,
+                            end_fraction,
+                            (frame_index + 1) / total_frames,
+                            stage="Writing temporary video",
+                        )
+
+            packet = stream.encode(None)
+            container.mux(packet)
+        finally:
+            container.close()
+
     def _run_inference(
         self,
         video_path,
@@ -1020,12 +1098,12 @@ class PililinkLatentSyncBase:
         deepcache_cache_interval=3,
         deepcache_branch_id=0,
         scheduler_type="ddim",
-        segment_overlap_clips=0,
         affine_detect_interval=1,
         skip_video_normalization=False,
         clip_batch_size=1,
         auto_oom_fallback=True,
         quality_mode="balanced",
+        progress_callback=None,
     ):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         package_root = os.path.dirname(cur_dir)
@@ -1071,8 +1149,8 @@ class PililinkLatentSyncBase:
             clip_batch_size=max(1, int(clip_batch_size)),
             auto_oom_fallback=bool(auto_oom_fallback),
             quality_mode=str(quality_mode or "balanced").lower(),
-            segment_overlap_clips=max(0, int(segment_overlap_clips)),
             affine_detect_interval=max(1, int(affine_detect_interval)),
+            progress_callback=progress_callback,
         )
 
 
@@ -1095,26 +1173,15 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 "deepcache_cache_interval": ("INT", {"default": 3, "min": 1, "max": 16, "step": 1}),
                 "deepcache_branch_id": ("INT", {"default": 0, "min": 0, "max": 4, "step": 1}),
                 "scheduler_type": (["ddim", "dpm_solver"], {"default": "ddim"}),
-                "segment_overlap_clips": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1}),
                 "affine_detect_interval": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
-                 },}
+                 },
+                "hidden": {"node_id": "UNIQUE_ID"}}
 
     CATEGORY = NODE_CATEGORY
 
     RETURN_TYPES = ("IMAGE", "AUDIO")
     RETURN_NAMES = ("images", "audio") 
     FUNCTION = "inference"
-
-    def process_batch(self, batch, use_mixed_precision=False):
-        with torch.cuda.amp.autocast(enabled=use_mixed_precision):
-            processed_batch = batch.float() / 255.0
-            if len(processed_batch.shape) == 3:
-                processed_batch = processed_batch.unsqueeze(0)
-            if processed_batch.shape[0] == 3:
-                processed_batch = processed_batch.permute(1, 2, 0)
-            if processed_batch.shape[-1] == 4:
-                processed_batch = processed_batch[..., :3]
-            return processed_batch
 
     def inference(
         self,
@@ -1132,10 +1199,13 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
         deepcache_cache_interval=3,
         deepcache_branch_id=0,
         scheduler_type="ddim",
-        segment_overlap_clips=0,
         affine_detect_interval=1,
+        node_id=None,
     ):
         throw_if_processing_interrupted()
+        ensure_runtime_ready()
+        progress = PililinkProgressReporter(node_id=node_id)
+        progress.update_fraction(0.01, stage="Initializing")
         # Add timing information
         start_time = time.time()
         
@@ -1155,7 +1225,8 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
             quality_mode=quality_mode,
         )
         run_id, temp_dir = self._create_run_temp_dir()
-        
+        progress.update_fraction(0.05, stage="Preparing inputs")
+
         temp_video_path = None
         output_video_path = None
         audio_path = None
@@ -1205,35 +1276,25 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 duplicated_frames = single_frame.unsqueeze(0).repeat(required_frames, 1, 1, 1)
                 frames = duplicated_frames
                 print(f"Pililink: Duplicated single image to create {required_frames} frames matching audio duration")
+            progress.update_fraction(0.12, stage="Frames ready")
 
             log_timing("Processing audio")
             throw_if_processing_interrupted()
             log_timing("Saving temporary files")
             throw_if_processing_interrupted()
             resampled_audio = save_audio_input(audio, audio_path)
+            progress.update_fraction(0.18, stage="Audio ready")
 
             # Move frames to CPU for saving to video
             frames_cpu = frames.cpu()
-            try:
-                if torchvision_io is None:
-                    raise RuntimeError("torchvision.io is not available")
-                torchvision_io.write_video(temp_video_path, frames_cpu, fps=25, video_codec='h264')
-            except (TypeError, RuntimeError, ValueError, AttributeError):
-                if av_mod is None:
-                    av_mod = __import__("av")
-                container = av_mod.open(temp_video_path, mode='w')
-                stream = container.add_stream('h264', rate=25)
-                stream.width = frames_cpu.shape[2]
-                stream.height = frames_cpu.shape[1]
-
-                for frame in frames_cpu:
-                    frame = av_mod.VideoFrame.from_ndarray(frame.numpy(), format='rgb24')
-                    packet = stream.encode(frame)
-                    container.mux(packet)
-
-                packet = stream.encode(None)
-                container.mux(packet)
-                container.close()
+            self._write_temp_video_with_progress(
+                frames_cpu,
+                temp_video_path,
+                fps=25,
+                progress=progress,
+                start_fraction=0.18,
+                end_fraction=0.30,
+            )
             
             # Free up memory after saving
             del frames_cpu
@@ -1255,16 +1316,17 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 deepcache_cache_interval=deepcache_cache_interval,
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
-                segment_overlap_clips=segment_overlap_clips,
                 affine_detect_interval=affine_detect_interval,
                 skip_video_normalization=True,
                 clip_batch_size=clip_batch_size,
                 auto_oom_fallback=auto_oom_fallback,
                 quality_mode=quality_mode,
+                progress_callback=progress.make_stage_callback(0.30, 0.92),
             )
 
             log_timing("Processing output")
             throw_if_processing_interrupted()
+            progress.update_fraction(0.94, stage="Loading output video")
             # Clean GPU cache after inference
             self._maybe_cuda_empty_cache(execution_settings)
 
@@ -1277,6 +1339,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 raise RuntimeError("torchvision.io is required for reading output video")
             processed_frames = torchvision_io.read_video(output_video_path, pts_unit='sec')[0]
             processed_frames = processed_frames.float() / 255.0
+            progress.update_fraction(0.99, stage="Finalizing outputs")
 
             # Ensure audio is on CPU before returning
             if torch.cuda.is_available():
@@ -1287,6 +1350,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
 
             total_time = time.time() - start_time
             print(f"Pililink total processing time: {total_time:.2f}s")
+            progress.update_fraction(1.0, stage="Done")
             
             return (processed_frames, resampled_audio)
 
@@ -1334,31 +1398,30 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
         return {
             "required": {
                 "video_path": ("STRING", {"default": "", "multiline": False, "placeholder": "D:/videos/input.mp4"}),
-                "seed": ("INT", {"default": 1247}),
-                "lips_expression": ("FLOAT", {"default": 1.5, "min": 1.0, "max": 3.0, "step": 0.1}),
-                "inference_steps": ("INT", {"default": 20, "min": 1, "max": 999, "step": 1}),
-                "vram_usage": (["high", "medium", "low"], {"default": "medium"}),
-                "segment_inferences": ("INT", {"default": 16, "min": 2, "max": 256, "step": 2}),
-                "clip_batch_size": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
-                "auto_oom_fallback": ("BOOLEAN", {"default": True}),
-                "quality_mode": (["balanced", "quality_first"], {"default": "balanced"}),
-                "deepcache": (["on", "off"], {"default": "on"}),
-                "deepcache_cache_interval": ("INT", {"default": 3, "min": 1, "max": 16, "step": 1}),
-                "deepcache_branch_id": ("INT", {"default": 0, "min": 0, "max": 4, "step": 1}),
-                "scheduler_type": (["ddim", "dpm_solver"], {"default": "ddim"}),
-                "segment_overlap_clips": ("INT", {"default": 0, "min": 0, "max": 8, "step": 1}),
-                "affine_detect_interval": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1}),
-                "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
-                "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 3.0, "step": 0.1}),
-                "auto_silent_padding": ("BOOLEAN", {"default": False}),
-                "result_mode": (["both", "memory_only"], {"default": "both"}),
-                "filename_prefix": ("STRING", {"default": "LatentSync/Pililink"}),
+                "seed": ("INT", {"default": PATH_NODE_DEFAULTS["seed"]}),
+                "lips_expression": ("FLOAT", {"default": PATH_NODE_DEFAULTS["lips_expression"], "min": 1.0, "max": 3.0, "step": 0.1}),
+                "inference_steps": ("INT", {"default": PATH_NODE_DEFAULTS["inference_steps"], "min": 1, "max": 999, "step": 1}),
+                "vram_usage": (["high", "medium", "low"], {"default": PATH_NODE_DEFAULTS["vram_usage"]}),
+                "segment_inferences": ("INT", {"default": PATH_NODE_DEFAULTS["segment_inferences"], "min": 2, "max": 256, "step": 2}),
+                "clip_batch_size": ("INT", {"default": PATH_NODE_DEFAULTS["clip_batch_size"], "min": 1, "max": 16, "step": 1}),
+                "auto_oom_fallback": ("BOOLEAN", {"default": PATH_NODE_DEFAULTS["auto_oom_fallback"]}),
+                "quality_mode": (["balanced", "quality_first"], {"default": PATH_NODE_DEFAULTS["quality_mode"]}),
+                "deepcache": (["on", "off"], {"default": PATH_NODE_DEFAULTS["deepcache"]}),
+                "deepcache_cache_interval": ("INT", {"default": PATH_NODE_DEFAULTS["deepcache_cache_interval"], "min": 1, "max": 16, "step": 1}),
+                "deepcache_branch_id": ("INT", {"default": PATH_NODE_DEFAULTS["deepcache_branch_id"], "min": 0, "max": 4, "step": 1}),
+                "scheduler_type": (["ddim", "dpm_solver"], {"default": PATH_NODE_DEFAULTS["scheduler_type"]}),
+                "affine_detect_interval": ("INT", {"default": PATH_NODE_DEFAULTS["affine_detect_interval"], "min": 1, "max": 8, "step": 1}),
+                "mode": (["normal", "pingpong", "loop_to_audio"], {"default": PATH_NODE_DEFAULTS["mode"]}),
+                "silent_padding_sec": ("FLOAT", {"default": PATH_NODE_DEFAULTS["silent_padding_sec"], "min": 0.0, "max": 3.0, "step": 0.1}),
+                "auto_silent_padding": ("BOOLEAN", {"default": PATH_NODE_DEFAULTS["auto_silent_padding"]}),
+                "filename_prefix": ("STRING", {"default": PATH_NODE_DEFAULTS["filename_prefix"]}),
             },
             "optional": {
                 "audio": ("AUDIO",),
                 "audio_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Leave empty to use audio input or the video's original audio"}),
                 "output_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional absolute output .mp4 path"}),
             },
+            "hidden": {"node_id": "UNIQUE_ID"},
         }
 
     CATEGORY = NODE_CATEGORY
@@ -1371,46 +1434,44 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
         self,
         video_path,
         seed,
-        lips_expression=1.5,
-        inference_steps=20,
-        vram_usage="medium",
-        segment_inferences=16,
-        clip_batch_size=1,
-        auto_oom_fallback=True,
-        quality_mode="balanced",
-        deepcache="on",
-        deepcache_cache_interval=3,
-        deepcache_branch_id=0,
-        scheduler_type="ddim",
-        segment_overlap_clips=0,
-        affine_detect_interval=1,
-        mode="normal",
-        silent_padding_sec=0.5,
-        auto_silent_padding=False,
-        result_mode="memory_only",
-        filename_prefix="LatentSync/Pililink",
+        lips_expression=PATH_NODE_DEFAULTS["lips_expression"],
+        inference_steps=PATH_NODE_DEFAULTS["inference_steps"],
+        vram_usage=PATH_NODE_DEFAULTS["vram_usage"],
+        segment_inferences=PATH_NODE_DEFAULTS["segment_inferences"],
+        clip_batch_size=PATH_NODE_DEFAULTS["clip_batch_size"],
+        auto_oom_fallback=PATH_NODE_DEFAULTS["auto_oom_fallback"],
+        quality_mode=PATH_NODE_DEFAULTS["quality_mode"],
+        deepcache=PATH_NODE_DEFAULTS["deepcache"],
+        deepcache_cache_interval=PATH_NODE_DEFAULTS["deepcache_cache_interval"],
+        deepcache_branch_id=PATH_NODE_DEFAULTS["deepcache_branch_id"],
+        scheduler_type=PATH_NODE_DEFAULTS["scheduler_type"],
+        affine_detect_interval=PATH_NODE_DEFAULTS["affine_detect_interval"],
+        mode=PATH_NODE_DEFAULTS["mode"],
+        silent_padding_sec=PATH_NODE_DEFAULTS["silent_padding_sec"],
+        auto_silent_padding=PATH_NODE_DEFAULTS["auto_silent_padding"],
+        filename_prefix=PATH_NODE_DEFAULTS["filename_prefix"],
         audio=None,
         audio_path="",
         output_path="",
+        node_id=None,
     ):
         throw_if_processing_interrupted()
+        ensure_runtime_ready()
+        progress = PililinkProgressReporter(node_id=node_id)
+        progress.update_fraction(0.01, stage="Initializing")
         start_time = time.time()
         resolved_video_path = resolve_user_path(video_path, "video_path")
+
         execution_settings = self._prepare_execution_settings(
             inference_steps,
             vram_usage,
             quality_mode=quality_mode,
         )
         run_id, temp_dir = self._create_run_temp_dir()
+        progress.update_fraction(0.05, stage="Resolving media")
 
         temp_audio_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_audio.wav")
-        final_output_path, output_filename, preserve_output_file = resolve_path_node_output_target(
-            filename_prefix=filename_prefix,
-            output_path=output_path,
-            result_mode=result_mode,
-            temp_dir=temp_dir,
-            run_id=run_id,
-        )
+        final_output_path, output_filename = get_output_video_path(filename_prefix, output_path)
 
         try:
             audio_path_text = str(audio_path or "").strip()
@@ -1422,6 +1483,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             else:
                 print("Pililink: No audio input provided, extracting audio track from source video")
                 resolved_audio_path = extract_audio_from_video(resolved_video_path, temp_audio_path)
+            progress.update_fraction(0.12, stage="Audio ready")
 
             aligned_video_path, aligned_audio_path = match_path_node_lengths(
                 resolved_video_path,
@@ -1431,12 +1493,10 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 temp_dir,
                 auto_silent_padding=auto_silent_padding,
             )
+            progress.update_fraction(0.20, stage="Media aligned")
 
             print(f"Pililink: Processing source video path {resolved_video_path}")
-            if preserve_output_file:
-                print(f"Pililink: Saving output video to {final_output_path}")
-            else:
-                print(f"Pililink: Writing temporary result video to {final_output_path}")
+            print(f"Pililink: Saving output video to {final_output_path}")
 
             self._run_inference(
                 video_path=aligned_video_path,
@@ -1452,12 +1512,12 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 deepcache_cache_interval=deepcache_cache_interval,
                 deepcache_branch_id=deepcache_branch_id,
                 scheduler_type=scheduler_type,
-                segment_overlap_clips=segment_overlap_clips,
                 affine_detect_interval=affine_detect_interval,
                 skip_video_normalization=is_probably_25fps_video(aligned_video_path),
                 clip_batch_size=clip_batch_size,
                 auto_oom_fallback=auto_oom_fallback,
                 quality_mode=quality_mode,
+                progress_callback=progress.make_stage_callback(0.20, 0.95),
             )
 
             total_time = time.time() - start_time
@@ -1467,15 +1527,15 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             self._maybe_cuda_empty_cache(execution_settings, force=True)
 
             # Load only audio from the output video (no IMAGE tensor to avoid OOM)
+            progress.update_fraction(0.97, stage="Loading output audio")
             output_audio = self._load_audio_only(final_output_path)
-            returned_video_path = final_output_path if preserve_output_file else ""
-            returned_filename = output_filename if preserve_output_file else ""
+            progress.update_fraction(1.0, stage="Done")
             return {
-                "ui": {"text": [returned_video_path or "[memory_only]"]},
+                "ui": {"text": [final_output_path]},
                 "result": (
                     output_audio,
-                    returned_video_path,
-                    returned_filename,
+                    final_output_path,
+                    output_filename,
                 ),
             }
         except RuntimeError as e:
@@ -1511,7 +1571,8 @@ class PililinkVideoLengthAdjuster:
                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
                 "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0}),
                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1}),
-            }
+            },
+            "hidden": {"node_id": "UNIQUE_ID"},
         }
 
     CATEGORY = NODE_CATEGORY
@@ -1581,11 +1642,37 @@ class PililinkVideoLengthAdjuster:
         
         if len(backward) == 0:
             return forward
-        
+
         return forward + backward
 
-    def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5):
+    def _materialize_frames_by_indices(
+        self,
+        original_frames,
+        final_indices,
+        progress=None,
+        start_fraction=0.0,
+        end_fraction=1.0,
+        stage="Assembling frames",
+    ):
+        adjusted_frames = []
+        total = len(final_indices)
+        for idx, frame_index in enumerate(final_indices):
+            throw_if_processing_interrupted()
+            adjusted_frames.append(original_frames[frame_index])
+            if progress is not None and total > 0:
+                if idx + 1 == total or ((idx + 1) % 8 == 0):
+                    progress.update_stage_fraction(
+                        start_fraction,
+                        end_fraction,
+                        (idx + 1) / total,
+                        stage=stage,
+                    )
+        return adjusted_frames
+
+    def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5, node_id=None):
         throw_if_processing_interrupted()  # Add interruption check at start
+        progress = PililinkProgressReporter(node_id=node_id)
+        progress.update_fraction(0.02, stage="Preparing inputs")
         
         waveform = audio["waveform"].squeeze(0)
         sample_rate = int(audio["sample_rate"])
@@ -1597,6 +1684,7 @@ class PililinkVideoLengthAdjuster:
             original_frames = images.copy()
         
         num_original_frames = len(original_frames)
+        progress.update_fraction(0.10, stage="Inputs ready")
         
         if num_original_frames == 0:
             raise ValueError("Pililink: Input images cannot be empty")
@@ -1606,6 +1694,7 @@ class PililinkVideoLengthAdjuster:
         
         if mode == "normal":
             throw_if_processing_interrupted()
+            progress.update_fraction(0.25, stage="Adjusting duration")
             # Add silent padding to the audio and then trim video to match
             audio_duration = waveform.shape[1] / sample_rate
             
@@ -1629,6 +1718,7 @@ class PililinkVideoLengthAdjuster:
                 padded_audio = padded_audio[:, :required_samples]
             
             throw_if_processing_interrupted()
+            progress.update_fraction(1.0, stage="Done")
             return (
                 torch.stack(adjusted_frames),
                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
@@ -1636,6 +1726,7 @@ class PililinkVideoLengthAdjuster:
 
         elif mode == "pingpong":
             throw_if_processing_interrupted()
+            progress.update_fraction(0.25, stage="Adjusting duration")
             video_duration = len(original_frames) / fps
             audio_duration = waveform.shape[1] / sample_rate
             
@@ -1645,6 +1736,7 @@ class PililinkVideoLengthAdjuster:
                 silence = torch.zeros((waveform.shape[0], required_samples - waveform.shape[1]), dtype=waveform.dtype)
                 adjusted_audio = torch.cat([waveform, silence], dim=1)
 
+                progress.update_fraction(1.0, stage="Done")
                 return (
                     torch.stack(original_frames),
                     {"waveform": adjusted_audio.unsqueeze(0), "sample_rate": sample_rate}
@@ -1673,10 +1765,17 @@ class PililinkVideoLengthAdjuster:
                     pingpong_indices, pingpong_cycle_len, target_frames, fps
                 )
                 
-                # Create frame list by indexing (no memory duplication)
-                adjusted_frames = [original_frames[i] for i in final_indices[:target_frames]]
+                adjusted_frames = self._materialize_frames_by_indices(
+                    original_frames,
+                    final_indices[:target_frames],
+                    progress=progress,
+                    start_fraction=0.35,
+                    end_fraction=0.95,
+                    stage="Building pingpong frames",
+                )
                 
                 throw_if_processing_interrupted()
+                progress.update_fraction(1.0, stage="Done")
                 return (
                     torch.stack(adjusted_frames),
                     {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
@@ -1684,6 +1783,7 @@ class PililinkVideoLengthAdjuster:
 
         elif mode == "loop_to_audio":
             throw_if_processing_interrupted()
+            progress.update_fraction(0.25, stage="Adjusting duration")
             # Add silent padding then simple loop
             silence_samples = math.ceil(silent_padding_sec * sample_rate)
             silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
@@ -1700,30 +1800,27 @@ class PililinkVideoLengthAdjuster:
                 loop_indices, num_original_frames, target_frames, fps
             )
             
-            # Create frame list by indexing (no memory duplication)
-            adjusted_frames = [original_frames[i] for i in final_indices[:target_frames]]
+            adjusted_frames = self._materialize_frames_by_indices(
+                original_frames,
+                final_indices[:target_frames],
+                progress=progress,
+                start_fraction=0.35,
+                end_fraction=0.95,
+                stage="Looping frames",
+            )
             
             throw_if_processing_interrupted()
+            progress.update_fraction(1.0, stage="Done")
             return (
                 torch.stack(adjusted_frames),
                 {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
             )
 
 
-class PililinkLatentSyncRefactorNode(PililinkLatentSyncNode):
-    CATEGORY = f"{NODE_CATEGORY}/Legacy"
-
-
-class PililinkLatentSyncRefactorVideoPathNode(PililinkLatentSyncVideoPathNode):
-    CATEGORY = f"{NODE_CATEGORY}/Legacy"
-
-
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
     NODE_KEY_MAIN: PililinkLatentSyncNode,
     NODE_KEY_MAIN_PATH: PililinkLatentSyncVideoPathNode,
-    NODE_KEY_MAIN_REFACTOR: PililinkLatentSyncRefactorNode,
-    NODE_KEY_MAIN_PATH_REFACTOR: PililinkLatentSyncRefactorVideoPathNode,
     NODE_KEY_ADJUSTER: PililinkVideoLengthAdjuster,
 }
 
@@ -1731,7 +1828,5 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     NODE_KEY_MAIN: NODE_DISPLAY_MAIN,
     NODE_KEY_MAIN_PATH: NODE_DISPLAY_MAIN_PATH,
-    NODE_KEY_MAIN_REFACTOR: NODE_DISPLAY_MAIN_REFACTOR,
-    NODE_KEY_MAIN_PATH_REFACTOR: NODE_DISPLAY_MAIN_PATH_REFACTOR,
     NODE_KEY_ADJUSTER: NODE_DISPLAY_ADJUSTER,
 }
