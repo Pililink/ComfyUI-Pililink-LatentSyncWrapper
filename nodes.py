@@ -585,6 +585,29 @@ def get_output_video_path(filename_prefix, output_path=""):
     return os.path.join(full_output_folder, output_filename), output_filename
 
 
+def build_output_file_ui_entry(file_path, *, media_format=None, media_type="output"):
+    output_root = os.path.abspath(folder_paths.get_output_directory())
+    absolute_path = os.path.abspath(file_path)
+    try:
+        relative_path = os.path.relpath(absolute_path, output_root)
+    except ValueError:
+        relative_path = os.path.basename(absolute_path)
+
+    relative_path = str(relative_path).replace("\\", "/")
+    if not relative_path or relative_path == ".":
+        relative_path = os.path.basename(absolute_path)
+
+    entry = {
+        "filename": relative_path,
+        "subfolder": "",
+        "type": media_type,
+        "fullpath": absolute_path,
+    }
+    if media_format:
+        entry["format"] = media_format
+    return entry
+
+
 def save_audio_input(audio, target_audio_path):
     if audio is None:
         raise ValueError("Pililink: audio input is required")
@@ -1530,8 +1553,16 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             progress.update_fraction(0.97, stage="Loading output audio")
             output_audio = self._load_audio_only(final_output_path)
             progress.update_fraction(1.0, stage="Done")
+            video_preview = build_output_file_ui_entry(
+                final_output_path,
+                media_format="video/mp4",
+                media_type="output",
+            )
             return {
-                "ui": {"text": [final_output_path]},
+                "ui": {
+                    "text": [final_output_path],
+                    "gifs": [video_preview],
+                },
                 "result": (
                     output_audio,
                     final_output_path,
