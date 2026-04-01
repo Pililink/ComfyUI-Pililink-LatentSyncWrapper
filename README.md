@@ -1,4 +1,4 @@
-# ComfyUI-Pililink-LatentSyncWrapper
+# ComfyUI LatentSync 1.5 Wrapper
 
 这是一个面向 **ComfyUI** 的 LatentSync 1.5 自定义节点封装，重点是：
 
@@ -24,10 +24,10 @@
    - 接入 ComfyUI 中断检查
    - 在关键循环与 ffmpeg 合成阶段都可响应中断
 
-4. **节点命名（Pililink）**
-   - 主节点：`Pililink LatentSync 1.5`
-   - 路径版节点：`Pililink LatentSync 1.5 (Video Path)`
-   - 辅助节点：`Pililink LatentSync Length Adjuster`
+4. **节点命名**
+   - 主节点：`LatentSync 1.5`
+   - 路径版节点：`LatentSync 1.5 (Video Path)`
+   - 辅助节点：`LatentSync Length Adjuster`
 
 ---
 
@@ -38,7 +38,7 @@
 ```bash
 cd ComfyUI/custom_nodes
 git clone <your-repo-url>
-cd ComfyUI-Pililink-LatentSyncWrapper
+cd <repo-folder>
 pip install -r requirements.txt
 ```
 
@@ -133,13 +133,13 @@ latensync1.5/
 
 ## 长视频推荐工作流
 
-长视频尽量不要走 `Load Video (Upload) 🎥🅥🅗🅢 -> IMAGE` 这条链路，因为它会在进入 Pililink 之前先把整段视频展开到内存。
+长视频尽量不要走 `Load Video (Upload) 🎥🅥🅗🅢 -> IMAGE` 这条链路，因为它会在进入 LatentSync 节点之前先把整段视频展开到内存。
 
 推荐改成：
 
 ```text
 字符串路径 / 路径输入节点
-        -> Pililink LatentSync 1.5 (Video Path)
+        -> LatentSync 1.5 (Video Path)
         -> 输出 mp4 路径
 ```
 
@@ -161,7 +161,7 @@ latensync1.5/
 
 - 输入视频会按流程要求处理为 25fps 路径后再推理
 - 对超长视频，速度会下降但稳定性更高（这是分段策略的预期）
-- 如果已安装 `DeepCache`，当前版本会自动启用；如需临时排查兼容问题，可设置环境变量 `PILILINK_DISABLE_DEEPCACHE=1` 后再启动 ComfyUI
+- 如果已安装 `DeepCache`，当前版本会自动启用；如需临时排查兼容问题，可设置环境变量 `LATENTSYNC_DISABLE_DEEPCACHE=1` 后再启动 ComfyUI
 - 推荐起步组合：`deepcache=on`、`deepcache_cache_interval=3`、`deepcache_branch_id=0`
 - 如果你更追求速度，可以试 `deepcache_cache_interval=5`；如果画质或口型稳定性下降，再退回 `3`
 

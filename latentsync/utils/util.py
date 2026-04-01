@@ -402,7 +402,7 @@ def iter_video_cv2(video_path: str, chunk_size: int, prefetch_chunks: int = None
     sentinel = object()
     reader_errors = []
 
-    print(f"Pililink: Video RAM prefetch enabled with {resolved_prefetch_chunks} chunks")
+    print(f"LatentSync: Video RAM prefetch enabled with {resolved_prefetch_chunks} chunks")
 
     def put_with_backpressure(item):
         while not stop_event.is_set():
@@ -440,7 +440,7 @@ def iter_video_cv2(video_path: str, chunk_size: int, prefetch_chunks: int = None
             cap.release()
             put_with_backpressure(sentinel)
 
-    reader_thread = threading.Thread(target=reader, name="pililink_video_prefetch", daemon=True)
+    reader_thread = threading.Thread(target=reader, name="latentsync_video_prefetch", daemon=True)
     reader_thread.start()
 
     try:

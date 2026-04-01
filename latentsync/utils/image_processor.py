@@ -44,7 +44,8 @@ class ImageProcessor:
         self.device_str = "cuda" if str(device).lower() != "cpu" and torch.cuda.is_available() else "cpu"
         self.torch_device = torch.device(self.device_str)
         self.use_gpu_affine = self.device_str == "cuda"
-        self.max_detection_size = max(256, int(os.environ.get("PILILINK_FACE_DETECT_MAX_SIZE", "960")))
+        detect_size_env = os.environ.get("LATENTSYNC_FACE_DETECT_MAX_SIZE", "960")
+        self.max_detection_size = max(256, int(detect_size_env))
         self._output_coord_cache = {}
         self.resize = transforms.Resize(
             (resolution, resolution), interpolation=transforms.InterpolationMode.BILINEAR, antialias=True

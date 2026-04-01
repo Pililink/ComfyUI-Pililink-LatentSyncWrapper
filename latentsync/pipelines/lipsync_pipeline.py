@@ -475,10 +475,10 @@ class LipsyncPipeline(DiffusionPipeline):
                     _report_progress(progress_callback, progress_fraction, "Aligning faces")
 
         if failed_indices:
-            print(f"[Pililink] Warning: Face not detected in {len(failed_indices)}/{len(video_frames)} frames")
+            print(f"[LatentSync] Warning: Face not detected in {len(failed_indices)}/{len(video_frames)} frames")
         if reused_indices:
             print(
-                f"[Pililink] Reused affine matrix for {len(reused_indices)}/{len(video_frames)} frames "
+                f"[LatentSync] Reused affine matrix for {len(reused_indices)}/{len(video_frames)} frames "
                 f"(interval={affine_detect_interval})"
             )
 
@@ -568,7 +568,7 @@ class LipsyncPipeline(DiffusionPipeline):
         _pipeline_t0 = time.time()
 
         def _log_step(label):
-            print(f"[Pililink {time.time() - _pipeline_t0:.2f}s] {label}")
+            print(f"[LatentSync {time.time() - _pipeline_t0:.2f}s] {label}")
 
         _log_step("Pipeline start | preparing audio features & video normalization")
         _report_progress(progress_callback, 0.14, "Preparing audio and video")
@@ -628,7 +628,7 @@ class LipsyncPipeline(DiffusionPipeline):
         restore_executor = ThreadPoolExecutor(max_workers=1)
         pending_restore_future = None
         print(
-            "Pililink progress init:",
+            "LatentSync progress init:",
             f"total_clips={total_inferences}",
             f"total_frames={total_output_frames}",
             f"segment_inferences={segment_inferences}",
@@ -654,7 +654,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 processed_segments += 1
                 _seg_t0 = time.time()
                 print(
-                    f"[Pililink] Segment {processed_segments}/{total_segments} start | "
+                    f"[LatentSync] Segment {processed_segments}/{total_segments} start | "
                     f"clips {global_inference_index}/{total_inferences} | "
                     f"frames {processed_frame_count}/{total_output_frames}"
                 )
@@ -833,7 +833,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 if overall_ratio > 0:
                     eta_seconds = elapsed * (1.0 / overall_ratio - 1.0)
                 print(
-                    f"[Pililink] Segment {processed_segments}/{total_segments} done | "
+                    f"[LatentSync] Segment {processed_segments}/{total_segments} done | "
                     f"clips {global_inference_index}/{total_inferences} ({overall_ratio * 100:.1f}%) | "
                     f"elapsed {elapsed:.1f}s | eta {eta_seconds:.1f}s"
                 )
@@ -858,7 +858,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     close_ffmpeg_video_pipe_writer(video_writer, timeout=60)
                     _log_step(f"FFmpeg pipe writer closed ({time.time() - _close_t0:.2f}s)")
                 except Exception as e:
-                    print(f"[Pililink] FFmpeg pipe writer cleanup warning: {e}")
+                    print(f"[LatentSync] FFmpeg pipe writer cleanup warning: {e}")
                 video_writer = None
 
         if is_train:

@@ -40,8 +40,15 @@ def throw_if_processing_interrupted():
         comfy_model_management.throw_exception_if_processing_interrupted()
 
 
+def is_env_flag_enabled(*names):
+    for name in names:
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
 def maybe_enable_deepcache(pipeline, args, device_str):
-    disable_by_env = os.environ.get("PILILINK_DISABLE_DEEPCACHE", "").strip().lower() in {"1", "true", "yes", "on"}
+    disable_by_env = is_env_flag_enabled("LATENTSYNC_DISABLE_DEEPCACHE")
     if getattr(args, "disable_deepcache", False) or disable_by_env:
         print("DeepCache disabled for this run")
         return None

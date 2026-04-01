@@ -64,13 +64,13 @@ _LATENTSYNC_PATHS = initialize_latentsync_paths()
 LATENTSYNC_ROOT_DIR = _LATENTSYNC_PATHS["root"]
 HF_CACHE_DIR = _LATENTSYNC_PATHS["hf_cache_dir"]
 
-NODE_CATEGORY = "PililinkLatentSync"
-NODE_KEY_MAIN = "PililinkLatentSyncNode"
-NODE_KEY_ADJUSTER = "PililinkLatentSyncLengthAdjuster"
-NODE_KEY_MAIN_PATH = "PililinkLatentSyncVideoPathNode"
-NODE_DISPLAY_MAIN = "Pililink LatentSync 1.5"
-NODE_DISPLAY_ADJUSTER = "Pililink LatentSync Length Adjuster"
-NODE_DISPLAY_MAIN_PATH = "Pililink LatentSync 1.5 (Video Path)"
+NODE_CATEGORY = "LatentSync"
+NODE_KEY_MAIN = "LatentSyncNode"
+NODE_KEY_ADJUSTER = "LatentSyncLengthAdjuster"
+NODE_KEY_MAIN_PATH = "LatentSyncVideoPathNode"
+NODE_DISPLAY_MAIN = "LatentSync 1.5"
+NODE_DISPLAY_ADJUSTER = "LatentSync Length Adjuster"
+NODE_DISPLAY_MAIN_PATH = "LatentSync 1.5 (Video Path)"
 _FFMPEG_VIDEO_ENCODERS = None
 _RUNTIME_SETUP_DONE = False
 _RUNTIME_SETUP_LOCK = threading.Lock()
@@ -92,7 +92,7 @@ PATH_NODE_DEFAULTS = {
     "mode": "normal",
     "silent_padding_sec": 0.5,
     "auto_silent_padding": False,
-    "filename_prefix": "LatentSync/Pililink",
+    "filename_prefix": "LatentSync",
 }
 
 
@@ -108,7 +108,7 @@ def _clamp_progress_fraction(value):
     return value
 
 
-class PililinkProgressReporter:
+class LatentSyncProgressReporter:
     def __init__(self, *, total=1000, node_id=None):
         self.total = max(1, int(total))
         self.node_id = str(node_id) if node_id is not None else None
@@ -135,7 +135,7 @@ class PililinkProgressReporter:
 
         try:
             PromptServer.instance.send_sync(
-                "pililink.progress.stage",
+                "latentsync_wrapper.progress.stage",
                 {
                     "node": self.node_id,
                     "stage": stage,
@@ -183,7 +183,7 @@ def check_for_conflicts():
         original_path = os.path.join(custom_nodes_dir, "ComfyUI-LatentSyncWrapper")
         
         if os.path.exists(original_path):
-            print("[Pililink LatentSync] Detected ComfyUI-LatentSyncWrapper - using isolated paths to avoid conflicts")
+            print("[LatentSync] Detected ComfyUI-LatentSyncWrapper - using isolated wrapper paths to avoid conflicts")
             return True
     except:
         pass
@@ -234,7 +234,7 @@ def init_temp_directories():
     comfy_temp_root = get_comfy_temp_root()
     os.makedirs(comfy_temp_root, exist_ok=True)
 
-    session_dir = os.path.join(comfy_temp_root, f"pilkilink_latentsync_{uuid.uuid4().hex[:8]}")
+    session_dir = os.path.join(comfy_temp_root, f"latentsync_wrapper_session_{uuid.uuid4().hex[:8]}")
     os.makedirs(session_dir, exist_ok=True)
 
     print(f"Set up ComfyUI temp directory: {session_dir}")
@@ -298,9 +298,9 @@ def get_latentsync_path(*parts, mkdir_parent=False):
 
 def import_refactor_runtime_module():
     try:
-        from . import pililink_refactor_runtime as runtime_mod
+        from . import latentsync_refactor_runtime as runtime_mod
     except Exception:
-        import pililink_refactor_runtime as runtime_mod
+        import latentsync_refactor_runtime as runtime_mod
     return runtime_mod
 
 def check_ffmpeg():
@@ -339,9 +339,9 @@ def check_and_install_dependencies():
     # Create the cache directory if it doesn't exist
     os.makedirs(cache_dir, exist_ok=True)
     
-    cache_marker = os.path.join(cache_dir, ".pililink_deps_installed")
+    cache_marker = os.path.join(cache_dir, ".latentsync_wrapper_deps_installed")
     if os.path.exists(cache_marker):
-        print("Pililink dependencies already verified, skipping check.")
+        print("LatentSync dependencies already verified, skipping check.")
         return
         
     def is_package_installed(package_name):
@@ -377,7 +377,7 @@ def check_and_install_dependencies():
     # Create marker file
     try:
         with open(cache_marker, 'w') as f:
-            f.write(f"Pililink dependencies checked on {time.ctime()}")
+            f.write(f"LatentSync dependencies checked on {time.ctime()}")
     except Exception as e:
         print(f"Warning: Could not create cache marker file: {str(e)}")
 
@@ -431,9 +431,9 @@ def pre_download_models():
     os.makedirs(cache_dir, exist_ok=True)
     
     # Check if we've already run this function successfully by creating a marker file
-    cache_marker = os.path.join(cache_dir, ".pililink_cache_complete")
+    cache_marker = os.path.join(cache_dir, ".latentsync_wrapper_cache_complete")
     if os.path.exists(cache_marker):
-        print("Pre-downloaded Pililink models already exist, skipping download.")
+        print("Pre-downloaded LatentSync models already exist, skipping download.")
         return
     
     for model_name, url in models.items():
@@ -442,11 +442,11 @@ def pre_download_models():
             print(f"Downloading {model_name}...")
             download_model(url, save_path)
         else:
-            print(f"{model_name} already exists in Pililink cache.")
+            print(f"{model_name} already exists in the LatentSync cache.")
     
     # Create marker file to indicate successful completion
     with open(cache_marker, 'w') as f:
-        f.write(f"Pililink cache completed on {time.ctime()}")
+        f.write(f"LatentSync cache completed on {time.ctime()}")
 
 def setup_models():
     """Setup and pre-download all required models."""
@@ -472,10 +472,10 @@ def setup_models():
 
     # Only download if the files don't already exist
     if os.path.exists(unet_path) and os.path.exists(whisper_path):
-        print("Pililink model checkpoints already exist, skipping download.")
+        print("LatentSync model checkpoints already exist, skipping download.")
         return
         
-    print("Downloading required Pililink model checkpoints... This may take a while.")
+    print("Downloading required LatentSync model checkpoints... This may take a while.")
     try:
         throw_if_processing_interrupted()
         if snapshot_download is None:
@@ -486,27 +486,27 @@ def setup_models():
                          local_dir_use_symlinks=False,
                          cache_dir=temp_downloads)
         throw_if_processing_interrupted()
-        print("Pililink model checkpoints downloaded successfully!")
+        print("LatentSync model checkpoints downloaded successfully!")
     except Exception as e:
-        print(f"Error downloading Pililink models: {str(e)}")
-        print("\nPlease download models manually for Pililink LatentSync:")
+        print(f"Error downloading LatentSync models: {str(e)}")
+        print("\nPlease download models manually for LatentSync:")
         print("1. Visit: https://huggingface.co/chunyu-li/LatentSync")
         print("2. Download: latentsync_unet.pt and whisper/tiny.pt")
         print(f"3. Place them in: {ckpt_dir}")
         print(f"   with whisper/tiny.pt in: {whisper_dir}")
-        raise RuntimeError("Pililink model download failed. See instructions above.")
+        raise RuntimeError("LatentSync model download failed. See instructions above.")
 
 def resolve_user_path(path_value, input_name):
     if path_value is None:
-        raise ValueError(f"Pililink: {input_name} is required")
+        raise ValueError(f"LatentSync: {input_name} is required")
 
     resolved_path = str(path_value).strip().strip('"').strip("'")
     if not resolved_path:
-        raise ValueError(f"Pililink: {input_name} cannot be empty")
+        raise ValueError(f"LatentSync: {input_name} cannot be empty")
 
     resolved_path = os.path.abspath(os.path.expandvars(os.path.expanduser(resolved_path)))
     if not os.path.exists(resolved_path):
-        raise FileNotFoundError(f"Pililink: {input_name} not found: {resolved_path}")
+        raise FileNotFoundError(f"LatentSync: {input_name} not found: {resolved_path}")
 
     return resolved_path
 
@@ -563,22 +563,41 @@ def get_ffmpeg_video_encode_args(codec=None):
 
 
 def get_output_video_path(filename_prefix, output_path=""):
+    output_root = os.path.abspath(folder_paths.get_output_directory())
     output_path = str(output_path or "").strip().strip('"').strip("'")
-    if output_path:
-        resolved_output_path = os.path.abspath(os.path.expandvars(os.path.expanduser(output_path)))
-        root, ext = os.path.splitext(resolved_output_path)
-        if not ext:
-            resolved_output_path = root + ".mp4"
-        output_dir = os.path.dirname(resolved_output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        return resolved_output_path, os.path.basename(resolved_output_path)
 
-    output_dir = folder_paths.get_output_directory()
+    if output_path:
+        expanded_output_path = os.path.expandvars(os.path.expanduser(output_path))
+        if os.path.isabs(expanded_output_path):
+            resolved_output_path = os.path.abspath(expanded_output_path)
+        else:
+            resolved_output_path = os.path.abspath(os.path.join(output_root, expanded_output_path))
+
+        treat_as_directory = output_path.endswith(("/", "\\")) or (
+            os.path.isdir(resolved_output_path) and not os.path.isfile(resolved_output_path)
+        )
+        if treat_as_directory:
+            target_dir = resolved_output_path
+            target_prefix = filename_prefix
+        else:
+            parent_dir = os.path.dirname(resolved_output_path) or output_root
+            base_name = os.path.splitext(os.path.basename(resolved_output_path))[0] or "LatentSync"
+            target_dir = parent_dir
+            target_prefix = base_name
+
+        try:
+            full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(target_prefix, target_dir)
+        except TypeError:
+            full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(target_prefix, target_dir, 0, 0)
+
+        os.makedirs(full_output_folder, exist_ok=True)
+        output_filename = f"{filename}_{counter:05d}.mp4"
+        return os.path.join(full_output_folder, output_filename), output_filename
+
     try:
-        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(filename_prefix, output_dir)
+        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(filename_prefix, output_root)
     except TypeError:
-        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(filename_prefix, output_dir, 0, 0)
+        full_output_folder, filename, counter, _, _ = folder_paths.get_save_image_path(filename_prefix, output_root, 0, 0)
 
     os.makedirs(full_output_folder, exist_ok=True)
     output_filename = f"{filename}_{counter:05d}.mp4"
@@ -610,7 +629,7 @@ def build_output_file_ui_entry(file_path, *, media_format=None, media_type="outp
 
 def save_audio_input(audio, target_audio_path):
     if audio is None:
-        raise ValueError("Pililink: audio input is required")
+        raise ValueError("LatentSync: audio input is required")
 
     # ComfyUI may execute nodes under torch.inference_mode().
     # Some audio ops (for example torchaudio resampling) expect normal tensors.
@@ -675,12 +694,12 @@ def run_ffmpeg_video_command_with_fallback(command_builder, error_message):
         try:
             run_process_with_interrupt(command_builder(codec), error_message)
             if codec != preferred_codec:
-                print(f"Pililink: ffmpeg video encoder fallback succeeded with {codec}")
+                print(f"LatentSync: ffmpeg video encoder fallback succeeded with {codec}")
             return
         except RuntimeError as exc:
             last_error = exc
             if codec != "libx264":
-                print(f"Pililink: ffmpeg video encoder {codec} failed, retrying with libx264")
+                print(f"LatentSync: ffmpeg video encoder {codec} failed, retrying with libx264")
                 continue
             raise
 
@@ -708,7 +727,7 @@ def extract_audio_from_video(video_path, target_audio_path):
     ]
     run_process_with_interrupt(command, f"Failed to extract audio from video: {video_path}")
     if not os.path.exists(target_audio_path):
-        raise RuntimeError(f"Pililink: extracted audio file missing: {target_audio_path}")
+        raise RuntimeError(f"LatentSync: extracted audio file missing: {target_audio_path}")
     return target_audio_path
 
 
@@ -763,9 +782,9 @@ def probe_media_duration(media_path, media_kind):
     try:
         duration = float(str(output).strip())
     except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Pililink: invalid {media_kind} duration reported for {media_path}: {output!r}") from exc
+        raise RuntimeError(f"LatentSync: invalid {media_kind} duration reported for {media_path}: {output!r}") from exc
     if duration <= 0:
-        raise RuntimeError(f"Pililink: {media_kind} duration must be positive: {media_path}")
+        raise RuntimeError(f"LatentSync: {media_kind} duration must be positive: {media_path}")
     return duration
 
 
@@ -792,7 +811,7 @@ def adjust_audio_duration(audio_path, target_audio_path, target_duration):
     ]
     run_process_with_interrupt(command, f"Failed to adjust audio duration: {audio_path}")
     if not os.path.exists(target_audio_path):
-        raise RuntimeError(f"Pililink: adjusted audio file missing: {target_audio_path}")
+        raise RuntimeError(f"LatentSync: adjusted audio file missing: {target_audio_path}")
     return target_audio_path
 
 
@@ -815,7 +834,7 @@ def trim_video_to_duration(video_path, target_video_path, target_duration):
 
     run_ffmpeg_video_command_with_fallback(build_command, f"Failed to trim video duration: {video_path}")
     if not os.path.exists(target_video_path):
-        raise RuntimeError(f"Pililink: trimmed video file missing: {target_video_path}")
+        raise RuntimeError(f"LatentSync: trimmed video file missing: {target_video_path}")
     return target_video_path
 
 
@@ -840,7 +859,7 @@ def loop_video_to_duration(video_path, target_video_path, target_duration):
 
     run_ffmpeg_video_command_with_fallback(build_command, f"Failed to loop video to target duration: {video_path}")
     if not os.path.exists(target_video_path):
-        raise RuntimeError(f"Pililink: looped video file missing: {target_video_path}")
+        raise RuntimeError(f"LatentSync: looped video file missing: {target_video_path}")
     return target_video_path
 
 
@@ -865,7 +884,7 @@ def create_pingpong_cycle(video_path, cycle_video_path):
 
     run_ffmpeg_video_command_with_fallback(build_command, f"Failed to create pingpong video cycle: {video_path}")
     if not os.path.exists(cycle_video_path):
-        raise RuntimeError(f"Pililink: pingpong cycle video missing: {cycle_video_path}")
+        raise RuntimeError(f"LatentSync: pingpong cycle video missing: {cycle_video_path}")
     return cycle_video_path
 
 
@@ -876,7 +895,7 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
 
     resolved_mode = str(mode or "normal")
     if resolved_mode not in {"normal", "pingpong", "loop_to_audio"}:
-        raise ValueError(f"Pililink: unsupported length mode: {resolved_mode}")
+        raise ValueError(f"LatentSync: unsupported length mode: {resolved_mode}")
 
     resolved_video_path = video_path
     resolved_audio_path = audio_path
@@ -897,7 +916,7 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
         if effective_padding_sec > duration_epsilon and needs_adjustment(audio_duration, target_duration):
             resolved_audio_path = adjust_audio_duration(
                 audio_path,
-                build_temp_path("pililink_length_normal_audio.wav"),
+                build_temp_path("latentsync_length_normal_audio.wav"),
                 target_duration,
             )
     elif resolved_mode == "pingpong":
@@ -906,23 +925,23 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
             if needs_adjustment(audio_duration, target_duration):
                 resolved_audio_path = adjust_audio_duration(
                     audio_path,
-                    build_temp_path("pililink_length_pingpong_audio.wav"),
+                    build_temp_path("latentsync_length_pingpong_audio.wav"),
                     target_duration,
                 )
         else:
             target_duration = audio_duration + effective_padding_sec
             resolved_audio_path = adjust_audio_duration(
                 audio_path,
-                build_temp_path("pililink_length_pingpong_audio.wav"),
+                build_temp_path("latentsync_length_pingpong_audio.wav"),
                 target_duration,
             )
             pingpong_cycle_path = create_pingpong_cycle(
                 video_path,
-                build_temp_path("pililink_length_pingpong_cycle.mp4"),
+                build_temp_path("latentsync_length_pingpong_cycle.mp4"),
             )
             resolved_video_path = loop_video_to_duration(
                 pingpong_cycle_path,
-                build_temp_path("pililink_length_pingpong_video.mp4"),
+                build_temp_path("latentsync_length_pingpong_video.mp4"),
                 target_duration,
             )
     else:
@@ -930,37 +949,37 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
         if needs_adjustment(audio_duration, target_duration):
             resolved_audio_path = adjust_audio_duration(
                 audio_path,
-                build_temp_path("pililink_length_loop_audio.wav"),
+                build_temp_path("latentsync_length_loop_audio.wav"),
                 target_duration,
             )
         if target_duration < video_duration - duration_epsilon:
             resolved_video_path = trim_video_to_duration(
                 video_path,
-                build_temp_path("pililink_length_loop_video.mp4"),
+                build_temp_path("latentsync_length_loop_video.mp4"),
                 target_duration,
             )
         elif target_duration > video_duration + duration_epsilon:
             resolved_video_path = loop_video_to_duration(
                 video_path,
-                build_temp_path("pililink_length_loop_video.mp4"),
+                build_temp_path("latentsync_length_loop_video.mp4"),
                 target_duration,
             )
 
     print(
-        "Pililink: Length mode "
+        "LatentSync: Length mode "
         f"{resolved_mode}, video {video_duration:.3f}s, audio {audio_duration:.3f}s, "
         f"silent_padding {effective_padding_sec:.3f}s"
     )
     if resolved_video_path != video_path or resolved_audio_path != audio_path:
         print(
-            "Pililink: Prepared aligned inputs "
+            "LatentSync: Prepared aligned inputs "
             f"video={resolved_video_path}, audio={resolved_audio_path}"
         )
 
     return resolved_video_path, resolved_audio_path
 
 
-class PililinkLatentSyncBase:
+class LatentSyncNodeBase:
     def __init__(self):
         # Make sure our temp directory is the current one
         global MODULE_TEMP_DIR
@@ -995,7 +1014,7 @@ class PililinkLatentSyncBase:
             waveform = waveform.to(torch.float32).cpu().unsqueeze(0)
             return {"waveform": waveform, "sample_rate": sr}
         except Exception as e:
-            print(f"[Pililink] Audio extraction failed: {e}")
+            print(f"[LatentSync] Audio extraction failed: {e}")
             return {"waveform": torch.zeros((1, 1, 0), dtype=torch.float32), "sample_rate": 16000}
         finally:
             try:
@@ -1044,7 +1063,7 @@ class PililinkLatentSyncBase:
     def _create_run_temp_dir(self):
         global MODULE_TEMP_DIR
         run_id = ''.join(random.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(5))
-        temp_dir = os.path.join(MODULE_TEMP_DIR, f"pililink_run_{run_id}")
+        temp_dir = os.path.join(MODULE_TEMP_DIR, f"latentsync_wrapper_run_{run_id}")
         os.makedirs(temp_dir, exist_ok=True)
         return run_id, temp_dir
 
@@ -1177,7 +1196,7 @@ class PililinkLatentSyncBase:
         )
 
 
-class PililinkLatentSyncNode(PililinkLatentSyncBase):
+class LatentSyncNode(LatentSyncNodeBase):
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -1227,7 +1246,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
     ):
         throw_if_processing_interrupted()
         ensure_runtime_ready()
-        progress = PililinkProgressReporter(node_id=node_id)
+        progress = LatentSyncProgressReporter(node_id=node_id)
         progress.update_fraction(0.01, stage="Initializing")
         # Add timing information
         start_time = time.time()
@@ -1238,9 +1257,9 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
         # Define timing checkpoint function
         def log_timing(step):
             elapsed = time.time() - start_time
-            print(f"[Pililink {elapsed:.2f}s] {step}")
+            print(f"[LatentSync {elapsed:.2f}s] {step}")
         
-        log_timing("Starting Pililink inference")
+        log_timing("Starting LatentSync inference")
         
         execution_settings = self._prepare_execution_settings(
             inference_steps,
@@ -1257,9 +1276,9 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
         try:
             global av_mod
             # Create temporary file paths in our system temp directory
-            temp_video_path = os.path.join(temp_dir, f"pililink_temp_{run_id}.mp4")
-            output_video_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_out.mp4")
-            audio_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_audio.wav")
+            temp_video_path = os.path.join(temp_dir, f"latentsync_temp_{run_id}.mp4")
+            output_video_path = os.path.join(temp_dir, f"latentsync_{run_id}_out.mp4")
+            audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_audio.wav")
             
             log_timing("Processing input frames")
             throw_if_processing_interrupted()
@@ -1298,7 +1317,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                 single_frame = frames[0]
                 duplicated_frames = single_frame.unsqueeze(0).repeat(required_frames, 1, 1, 1)
                 frames = duplicated_frames
-                print(f"Pililink: Duplicated single image to create {required_frames} frames matching audio duration")
+                print(f"LatentSync: Duplicated single image to create {required_frames} frames matching audio duration")
             progress.update_fraction(0.12, stage="Frames ready")
 
             log_timing("Processing audio")
@@ -1323,7 +1342,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
             del frames_cpu
             self._maybe_cuda_empty_cache(execution_settings)
 
-            log_timing("Running Pililink inference")
+            log_timing("Running LatentSync inference")
             throw_if_processing_interrupted()
             self._run_inference(
                 video_path=temp_video_path,
@@ -1372,24 +1391,24 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
                     processed_frames = processed_frames.cpu()
 
             total_time = time.time() - start_time
-            print(f"Pililink total processing time: {total_time:.2f}s")
+            print(f"LatentSync total processing time: {total_time:.2f}s")
             progress.update_fraction(1.0, stage="Done")
             
             return (processed_frames, resampled_audio)
 
         except RuntimeError as e:
             if "Face not detected" in str(e) or "未检测到人脸" in str(e):
-                print(f"[Pililink] Face detection failed: {str(e)}")
+                print(f"[LatentSync] Face detection failed: {str(e)}")
                 raise RuntimeError(
                     "未检测到人脸：输入视频中未能识别到人脸，请检查输入视频是否包含清晰的正面人脸。\n"
                     "Face not detected: No face was found in the input video. "
                     "Please ensure the video contains a clearly visible frontal face."
                 ) from e
-            print(f"Error during Pililink inference: {str(e)}")
+            print(f"Error during LatentSync inference: {str(e)}")
             traceback.print_exc()
             raise
         except Exception as e:
-            print(f"Error during Pililink inference: {str(e)}")
+            print(f"Error during LatentSync inference: {str(e)}")
             traceback.print_exc()
             raise
 
@@ -1415,7 +1434,7 @@ class PililinkLatentSyncNode(PililinkLatentSyncBase):
             self._maybe_cuda_empty_cache(execution_settings)
 
 
-class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
+class LatentSyncVideoPathNode(LatentSyncNodeBase):
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -1442,7 +1461,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             "optional": {
                 "audio": ("AUDIO",),
                 "audio_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Leave empty to use audio input or the video's original audio"}),
-                "output_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional absolute output .mp4 path"}),
+                "output_path": ("STRING", {"default": "", "multiline": False, "placeholder": "Optional output path. Relative paths are saved under ComfyUI output/"}),
             },
             "hidden": {"node_id": "UNIQUE_ID"},
         }
@@ -1480,7 +1499,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
     ):
         throw_if_processing_interrupted()
         ensure_runtime_ready()
-        progress = PililinkProgressReporter(node_id=node_id)
+        progress = LatentSyncProgressReporter(node_id=node_id)
         progress.update_fraction(0.01, stage="Initializing")
         start_time = time.time()
         resolved_video_path = resolve_user_path(video_path, "video_path")
@@ -1493,7 +1512,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
         run_id, temp_dir = self._create_run_temp_dir()
         progress.update_fraction(0.05, stage="Resolving media")
 
-        temp_audio_path = os.path.join(temp_dir, f"pililink_latentsync_{run_id}_audio.wav")
+        temp_audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_audio.wav")
         final_output_path, output_filename = get_output_video_path(filename_prefix, output_path)
 
         try:
@@ -1504,7 +1523,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 save_audio_input(audio, temp_audio_path)
                 resolved_audio_path = temp_audio_path
             else:
-                print("Pililink: No audio input provided, extracting audio track from source video")
+                print("LatentSync: No audio input provided, extracting audio track from source video")
                 resolved_audio_path = extract_audio_from_video(resolved_video_path, temp_audio_path)
             progress.update_fraction(0.12, stage="Audio ready")
 
@@ -1518,8 +1537,8 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             )
             progress.update_fraction(0.20, stage="Media aligned")
 
-            print(f"Pililink: Processing source video path {resolved_video_path}")
-            print(f"Pililink: Saving output video to {final_output_path}")
+            print(f"LatentSync: Processing source video path {resolved_video_path}")
+            print(f"LatentSync: Saving output video to {final_output_path}")
 
             self._run_inference(
                 video_path=aligned_video_path,
@@ -1544,7 +1563,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             )
 
             total_time = time.time() - start_time
-            print(f"Pililink path-node total processing time: {total_time:.2f}s")
+            print(f"LatentSync path-node total processing time: {total_time:.2f}s")
 
             # Release GPU memory before building output
             self._maybe_cuda_empty_cache(execution_settings, force=True)
@@ -1571,17 +1590,17 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
             }
         except RuntimeError as e:
             if "Face not detected" in str(e) or "未检测到人脸" in str(e):
-                print(f"[Pililink] Face detection failed: {str(e)}")
+                print(f"[LatentSync] Face detection failed: {str(e)}")
                 raise RuntimeError(
                     "未检测到人脸：输入视频中未能识别到人脸，请检查输入视频是否包含清晰的正面人脸。\n"
                     "Face not detected: No face was found in the input video. "
                     "Please ensure the video contains a clearly visible frontal face."
                 ) from e
-            print(f"Error during Pililink path inference: {str(e)}")
+            print(f"Error during LatentSync path inference: {str(e)}")
             traceback.print_exc()
             raise
         except Exception as e:
-            print(f"Error during Pililink path inference: {str(e)}")
+            print(f"Error during LatentSync path inference: {str(e)}")
             traceback.print_exc()
             raise
         finally:
@@ -1592,7 +1611,7 @@ class PililinkLatentSyncVideoPathNode(PililinkLatentSyncBase):
                 pass
 
 
-class PililinkVideoLengthAdjuster:
+class LatentSyncVideoLengthAdjuster:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -1625,8 +1644,8 @@ class PililinkVideoLengthAdjuster:
             threshold_mb = max(1000, available_mb * 0.1)  # Keep 10% free or 1GB minimum
             
             if required_mb > available_mb - threshold_mb:
-                print(f"[Pililink WARNING] Estimated memory needed: {required_mb:.0f}MB, Available: {available_mb:.0f}MB")
-                print(f"[Pililink WARNING] Processing may be slow or fail. Consider shorter video duration.")
+                print(f"[LatentSync WARNING] Estimated memory needed: {required_mb:.0f}MB, Available: {available_mb:.0f}MB")
+                print(f"[LatentSync WARNING] Processing may be slow or fail. Consider shorter video duration.")
                 return False
             return True
         except (ImportError, Exception) as e:
@@ -1634,7 +1653,7 @@ class PililinkVideoLengthAdjuster:
             if torch.cuda.is_available():
                 try:
                     gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                    print(f"[Pililink INFO] GPU memory: {gpu_mem:.1f}GB, Processing {num_frames} frames")
+                    print(f"[LatentSync INFO] GPU memory: {gpu_mem:.1f}GB, Processing {num_frames} frames")
                 except:
                     pass
             return True
@@ -1702,7 +1721,7 @@ class PililinkVideoLengthAdjuster:
 
     def adjust(self, images, audio, mode, fps=25.0, silent_padding_sec=0.5, node_id=None):
         throw_if_processing_interrupted()  # Add interruption check at start
-        progress = PililinkProgressReporter(node_id=node_id)
+        progress = LatentSyncProgressReporter(node_id=node_id)
         progress.update_fraction(0.02, stage="Preparing inputs")
         
         waveform = audio["waveform"].squeeze(0)
@@ -1718,7 +1737,7 @@ class PililinkVideoLengthAdjuster:
         progress.update_fraction(0.10, stage="Inputs ready")
         
         if num_original_frames == 0:
-            raise ValueError("Pililink: Input images cannot be empty")
+            raise ValueError("LatentSync: Input images cannot be empty")
         
         # Pre-check memory capacity
         frame_shape = original_frames[0].shape if original_frames else images.shape[1:]
@@ -1789,7 +1808,7 @@ class PililinkVideoLengthAdjuster:
                 pingpong_cycle_len = len(pingpong_indices)
                 
                 if pingpong_cycle_len == 0:
-                    raise ValueError("Pililink: Pingpong sequence is empty")
+                    raise ValueError("LatentSync: Pingpong sequence is empty")
                 
                 # Use efficient indexed expansion
                 final_indices = self._expand_frames_efficient(
@@ -1850,9 +1869,9 @@ class PililinkVideoLengthAdjuster:
 
 # Node Mappings for ComfyUI
 NODE_CLASS_MAPPINGS = {
-    NODE_KEY_MAIN: PililinkLatentSyncNode,
-    NODE_KEY_MAIN_PATH: PililinkLatentSyncVideoPathNode,
-    NODE_KEY_ADJUSTER: PililinkVideoLengthAdjuster,
+    NODE_KEY_MAIN: LatentSyncNode,
+    NODE_KEY_MAIN_PATH: LatentSyncVideoPathNode,
+    NODE_KEY_ADJUSTER: LatentSyncVideoLengthAdjuster,
 }
 
 # Display Names for ComfyUI - Clear distinction from original

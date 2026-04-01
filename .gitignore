@@ -173,3 +173,42 @@ cython_debug/
 # Local tooling metadata
 .claude/
 .omc/
+
+# Editor / OS metadata
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Project runtime / training artifacts
+checkpoints/
+debug/
+output/
+train-*/
+logs/
+runs/
+wandb/
+temp/
+tmp/
+detect_results/
+syncnet_eval_results/
+val_videos/
+sync_conf_results/
+loss_charts/
+
+# Preprocess pipeline outputs
+resampled/
+shot/
+segmented/
+affine_transformed/
+av_synced_*/
+high_visual_quality/
+high_resolution/
+
+# Local model / cache directories
+hf_cache/
+torch_cache/
+runtime_cache/
+audio_cache/

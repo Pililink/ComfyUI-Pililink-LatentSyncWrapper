@@ -23,13 +23,13 @@ pip install -r requirements.txt
 - `nodes.py` — defines both ComfyUI nodes and all orchestration logic
 
 ### Two ComfyUI Nodes
-1. **`PililinkLatentSyncNode`** (`Pililink LatentSync 1.5`) — main lip-sync node. Accepts images + audio, writes temp video/audio files, invokes the inference pipeline, returns processed frames + audio.
-2. **`PililinkVideoLengthAdjuster`** (`Pililink LatentSync Length Adjuster`) — adjusts video length to match audio via normal trim, pingpong, or loop modes.
+1. **`LatentSyncNode`** (`LatentSync 1.5`) — main lip-sync node. Accepts images + audio, writes temp video/audio files, invokes the inference pipeline, returns processed frames + audio.
+2. **`LatentSyncVideoLengthAdjuster`** (`LatentSync Length Adjuster`) — adjusts video length to match audio via normal trim, pingpong, or loop modes.
 
 ### Inference Flow (`nodes.py` → `scripts/inference.py` → pipeline)
-`nodes.py:PililinkLatentSyncNode.inference()` is the main entry point:
+`nodes.py:LatentSyncNode.inference()` is the main entry point:
 1. Converts ComfyUI IMAGE/AUDIO tensors to temp .mp4/.wav files
-2. Dynamically imports `scripts/inference.py` via `importlib` (unique module name `pililink_latentsync_inference` to avoid conflicts with other LatentSync installations)
+2. Delegates runtime execution via `latentsync_refactor_runtime.py` to keep the heavy pipeline isolated and reusable
 3. `scripts/inference.py:main()` builds the diffusion pipeline: VAE (sd-vae-ft-mse) + Whisper audio encoder + UNet3D + DDIM scheduler
 4. `latentsync/pipelines/lipsync_pipeline.py:LipsyncPipeline.__call__()` runs segmented inference — processes video in chunks of `segment_inferences * 16` frames to control memory
 
@@ -56,9 +56,9 @@ Vendored/adapted from ByteDance LatentSync. Key subdirectories:
 ## Important Patterns
 
 - **ComfyUI interrupt support**: `throw_if_processing_interrupted()` is called at every major loop/step across `nodes.py`, `scripts/inference.py`, and `lipsync_pipeline.py`. Must be preserved in any new loops.
-- **Global model cache**: `_PILILINK_MODEL_CACHE` dict in `nodes.py` caches loaded models across node executions. Uses `pililink_` prefix to avoid conflicts.
+- **Runtime/cache isolation**: `nodes.py` uses `latentsync_wrapper_`-prefixed temp/cache markers to avoid clashes with other LatentSync wrappers.
 - **Temp file management**: Each module load creates a session temp dir under ComfyUI's temp root, cleaned up via `atexit`. Each inference run gets a unique subdirectory.
-- **Conflict avoidance**: The code detects coexisting `ComfyUI-LatentSyncWrapper` and uses isolated module names, cache keys, and temp paths prefixed with `pililink_`.
+- **Conflict avoidance**: The code detects coexisting `ComfyUI-LatentSyncWrapper` and uses isolated module names, cache keys, and temp paths prefixed with `latentsync_wrapper_`.
 - **`folder_paths` import**: ComfyUI's `folder_paths` module is imported via `__import__("folder_paths")` since it's only available at runtime within ComfyUI.
 
 ## Language

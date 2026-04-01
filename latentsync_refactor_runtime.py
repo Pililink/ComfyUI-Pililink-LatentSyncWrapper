@@ -47,6 +47,13 @@ _RUNTIME_CACHE = {}
 _RUNTIME_CACHE_LOCK = threading.Lock()
 
 
+def _is_env_flag_enabled(*names):
+    for name in names:
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
 def _safe_cache_stamp(path):
     absolute_path = os.path.abspath(path)
     try:
@@ -102,12 +109,7 @@ def _maybe_enable_deepcache(pipeline, deepcache, cache_interval, cache_branch_id
     if str(deepcache or "on").lower() == "off":
         return None
 
-    disable_by_env = os.environ.get("PILILINK_DISABLE_DEEPCACHE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    disable_by_env = _is_env_flag_enabled("LATENTSYNC_DISABLE_DEEPCACHE")
     if disable_by_env:
         return None
 
@@ -287,7 +289,7 @@ class _RefactorRuntime:
                 bool(auto_oom_fallback),
             )
             print(
-                "Pililink refactor runtime:",
+                "LatentSync refactor runtime:",
                 f"device={self.device_str}",
                 f"dtype={self.dtype}",
                 f"quality_mode={resolved_quality_mode}",
@@ -314,7 +316,7 @@ class _RefactorRuntime:
                     try:
                         if candidate_index > 0:
                             print(
-                                "Pililink refactor runtime retry:",
+                                "LatentSync refactor runtime retry:",
                                 f"segment_inferences={current_segment_inferences}",
                                 f"clip_batch_size={current_clip_batch_size}",
                             )
@@ -356,7 +358,7 @@ class _RefactorRuntime:
                         if has_next_candidate and _is_cuda_oom_error(exc):
                             _report_progress(progress_callback, "Retrying with smaller batch", 0.12)
                             print(
-                                "Pililink refactor runtime OOM:",
+                                "LatentSync refactor runtime OOM:",
                                 f"segment_inferences={current_segment_inferences}",
                                 f"clip_batch_size={current_clip_batch_size}",
                                 "-> trying a smaller execution candidate",
