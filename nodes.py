@@ -1,6 +1,7 @@
 import atexit
 import importlib.util
 import errno
+from fractions import Fraction
 import math
 import os
 import platform
@@ -810,6 +811,76 @@ def probe_media_duration(media_path, media_kind):
     return duration
 
 
+def _parse_ffprobe_key_value_output(output):
+    metadata = {}
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        metadata[key.strip()] = value.strip()
+    return metadata
+
+
+def _parse_ffprobe_rate(value):
+    text = str(value or "").strip()
+    if not text or text in {"0/0", "N/A"}:
+        return 0.0
+    try:
+        return float(Fraction(text))
+    except Exception:
+        try:
+            return float(text)
+        except Exception:
+            return 0.0
+
+
+def probe_video_stream_duration(video_path):
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames,duration,avg_frame_rate,r_frame_rate",
+        "-of",
+        "default=nokey=0:noprint_wrappers=1",
+        video_path,
+    ]
+    output = run_small_process_with_interrupt_capture(
+        command,
+        f"Failed to probe video stream duration: {video_path}",
+    )
+    metadata = _parse_ffprobe_key_value_output(output)
+
+    avg_fps = _parse_ffprobe_rate(metadata.get("avg_frame_rate"))
+    fallback_fps = _parse_ffprobe_rate(metadata.get("r_frame_rate"))
+    fps = avg_fps if avg_fps > 0.0 else fallback_fps
+
+    frame_count_text = str(metadata.get("nb_frames", "")).strip()
+    if frame_count_text and frame_count_text not in {"N/A"} and fps > 0.0:
+        try:
+            frame_count = int(round(float(frame_count_text)))
+        except Exception:
+            frame_count = 0
+        if frame_count > 0:
+            duration = frame_count / fps
+            if duration > 0.0:
+                return duration
+
+    stream_duration_text = str(metadata.get("duration", "")).strip()
+    if stream_duration_text and stream_duration_text not in {"N/A"}:
+        try:
+            duration = float(stream_duration_text)
+        except Exception:
+            duration = 0.0
+        if duration > 0.0:
+            return duration
+
+    return probe_media_duration(video_path, "video")
+
+
 def adjust_audio_duration(audio_path, target_audio_path, target_duration):
     command = [
         "ffmpeg",
@@ -1001,6 +1072,37 @@ def loop_video_to_duration(video_path, target_video_path, target_duration):
     return target_video_path
 
 
+def freeze_last_frame_video_to_duration(video_path, target_video_path, target_duration):
+    source_duration = probe_video_stream_duration(video_path)
+    freeze_duration = max(0.0, float(target_duration) - float(source_duration))
+
+    def build_command(codec):
+        return [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-vf",
+            f"tpad=stop_mode=clone:stop_duration={freeze_duration:.6f}",
+            "-t",
+            f"{target_duration:.6f}",
+            "-an",
+            *get_ffmpeg_video_encode_args(codec),
+            target_video_path,
+        ]
+
+    run_ffmpeg_video_command_with_fallback(
+        build_command,
+        f"Failed to freeze video tail to target duration: {video_path}",
+    )
+    if not os.path.exists(target_video_path):
+        raise RuntimeError(f"LatentSync: frozen-tail video file missing: {target_video_path}")
+    return target_video_path
+
+
 def create_pingpong_cycle(video_path, cycle_video_path):
     def build_command(codec):
         return [
@@ -1028,11 +1130,11 @@ def create_pingpong_cycle(video_path, cycle_video_path):
 
 def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, temp_dir, auto_silent_padding=False):
     duration_epsilon = 0.05
-    video_duration = probe_media_duration(video_path, "video")
+    video_duration = probe_video_stream_duration(video_path)
     audio_duration = probe_media_duration(audio_path, "audio")
 
     resolved_mode = str(mode or "normal")
-    if resolved_mode not in {"normal", "pingpong", "loop_to_audio"}:
+    if resolved_mode not in {"normal", "pingpong", "loop_to_audio", "freeze_last_frame_to_audio"}:
         raise ValueError(f"LatentSync: unsupported length mode: {resolved_mode}")
 
     resolved_video_path = video_path
@@ -1080,6 +1182,26 @@ def match_path_node_lengths(video_path, audio_path, mode, silent_padding_sec, te
             resolved_video_path = loop_video_to_duration(
                 pingpong_cycle_path,
                 build_temp_path("latentsync_length_pingpong_video.mp4"),
+                target_duration,
+            )
+    elif resolved_mode == "freeze_last_frame_to_audio":
+        target_duration = audio_duration + effective_padding_sec
+        if needs_adjustment(audio_duration, target_duration):
+            resolved_audio_path = adjust_audio_duration(
+                audio_path,
+                build_temp_path("latentsync_length_freeze_audio.wav"),
+                target_duration,
+            )
+        if target_duration < video_duration - duration_epsilon:
+            resolved_video_path = trim_video_to_duration(
+                video_path,
+                build_temp_path("latentsync_length_freeze_video.mp4"),
+                target_duration,
+            )
+        elif target_duration > video_duration + duration_epsilon:
+            resolved_video_path = freeze_last_frame_video_to_duration(
+                video_path,
+                build_temp_path("latentsync_length_freeze_video.mp4"),
                 target_duration,
             )
     else:
@@ -1591,7 +1713,7 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
                 "deepcache_branch_id": ("INT", {"default": PATH_NODE_DEFAULTS["deepcache_branch_id"], "min": 0, "max": 4, "step": 1}),
                 "scheduler_type": (["ddim", "dpm_solver"], {"default": PATH_NODE_DEFAULTS["scheduler_type"]}),
                 "affine_detect_interval": ("INT", {"default": PATH_NODE_DEFAULTS["affine_detect_interval"], "min": 1, "max": 8, "step": 1}),
-                "mode": (["normal", "pingpong", "loop_to_audio"], {"default": PATH_NODE_DEFAULTS["mode"]}),
+                "mode": (["normal", "pingpong", "loop_to_audio", "freeze_last_frame_to_audio"], {"default": PATH_NODE_DEFAULTS["mode"]}),
                 "silent_padding_sec": ("FLOAT", {"default": PATH_NODE_DEFAULTS["silent_padding_sec"], "min": 0.0, "max": 3.0, "step": 0.1}),
                 "auto_silent_padding": ("BOOLEAN", {"default": PATH_NODE_DEFAULTS["auto_silent_padding"]}),
                 "merge_source_audio": ("BOOLEAN", {"default": PATH_NODE_DEFAULTS["merge_source_audio"]}),
@@ -1799,7 +1921,7 @@ class LatentSyncVideoLengthAdjuster:
             "required": {
                 "images": ("IMAGE",),
                 "audio": ("AUDIO",),
-                "mode": (["normal", "pingpong", "loop_to_audio"], {"default": "normal"}),
+                "mode": (["normal", "pingpong", "loop_to_audio", "freeze_last_frame_to_audio"], {"default": "normal"}),
                 "fps": ("FLOAT", {"default": 25.0, "min": 1.0, "max": 120.0}),
                 "silent_padding_sec": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 3.0, "step": 0.1}),
             },
@@ -2040,6 +2162,37 @@ class LatentSyncVideoLengthAdjuster:
                 stage="Looping frames",
             )
             
+            throw_if_processing_interrupted()
+            progress.update_fraction(1.0, stage="Done")
+            return (
+                torch.stack(adjusted_frames),
+                {"waveform": padded_audio.unsqueeze(0), "sample_rate": sample_rate}
+            )
+
+        elif mode == "freeze_last_frame_to_audio":
+            throw_if_processing_interrupted()
+            progress.update_fraction(0.25, stage="Adjusting duration")
+            silence_samples = math.ceil(silent_padding_sec * sample_rate)
+            silence = torch.zeros((waveform.shape[0], silence_samples), dtype=waveform.dtype)
+            padded_audio = torch.cat([waveform, silence], dim=1)
+            total_duration = (waveform.shape[1] + silence_samples) / sample_rate
+            target_frames = math.ceil(total_duration * fps)
+
+            if target_frames <= num_original_frames:
+                adjusted_frames = original_frames[:target_frames]
+            else:
+                self._check_memory_capacity(target_frames, frame_shape)
+                final_indices = list(range(num_original_frames))
+                final_indices.extend([num_original_frames - 1] * (target_frames - num_original_frames))
+                adjusted_frames = self._materialize_frames_by_indices(
+                    original_frames,
+                    final_indices,
+                    progress=progress,
+                    start_fraction=0.35,
+                    end_fraction=0.95,
+                    stage="Freezing last frame",
+                )
+
             throw_if_processing_interrupted()
             progress.update_fraction(1.0, stage="Done")
             return (

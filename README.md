@@ -111,7 +111,7 @@ latensync1.5/
 - `deepcache_branch_id`：DeepCache 缓存分支，默认 `0`
 - `scheduler_type`：`ddim` / `dpm_solver`
 - `affine_detect_interval`：隔多少帧重新做人脸仿射检测，默认 `1`
-- `mode`：时长对齐模式，支持 `normal` / `pingpong` / `loop_to_audio`
+- `mode`：时长对齐模式，支持 `normal` / `pingpong` / `loop_to_audio` / `freeze_last_frame_to_audio`
 - `silent_padding_sec`：补齐音频时附加的静音秒数
 - `auto_silent_padding`：自动根据视频和音频时长差计算静音补齐时长
 - `merge_source_audio`：开启后，将源视频原音轨与传入的 `audio` / `audio_path` 混合到最终输出；默认关闭以保持旧行为
@@ -131,6 +131,7 @@ latensync1.5/
 - `normal`：对齐到较短一侧；如果视频比音频长，会先给音频补一小段静音再裁视频；如果音频比视频长，则裁音频
 - `pingpong`：当音频比视频长时，把视频做往返播放扩展到音频时长；当音频较短时，保留原视频并给音频补静音
 - `loop_to_audio`：循环视频直到覆盖音频时长，并可附加静音尾巴
+- `freeze_last_frame_to_audio`：当音频比视频长时，冻结最后一帧并持续到音频时长；当音频较短时，裁视频到目标时长
 
 ---
 
