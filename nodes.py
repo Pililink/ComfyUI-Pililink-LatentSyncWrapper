@@ -92,6 +92,7 @@ PATH_NODE_DEFAULTS = {
     "mode": "normal",
     "silent_padding_sec": 0.5,
     "auto_silent_padding": False,
+    "merge_source_audio": False,
     "filename_prefix": "LatentSync",
 }
 
@@ -731,6 +732,26 @@ def extract_audio_from_video(video_path, target_audio_path):
     return target_audio_path
 
 
+def video_has_audio_stream(video_path):
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        video_path,
+    ]
+    output = run_small_process_with_interrupt_capture(
+        command,
+        f"Failed to probe audio streams from video: {video_path}",
+    )
+    return bool(str(output or "").strip())
+
+
 def run_small_process_with_interrupt_capture(command, error_message, shell=False):
     process = None
     stdout = ""
@@ -813,6 +834,109 @@ def adjust_audio_duration(audio_path, target_audio_path, target_duration):
     if not os.path.exists(target_audio_path):
         raise RuntimeError(f"LatentSync: adjusted audio file missing: {target_audio_path}")
     return target_audio_path
+
+
+def mix_audio_tracks(primary_audio_path, secondary_audio_path, output_audio_path, target_duration=None):
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        primary_audio_path,
+        "-i",
+        secondary_audio_path,
+        "-filter_complex",
+        "[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0:normalize=1[mixed]",
+        "-map",
+        "[mixed]",
+    ]
+    if target_duration is not None:
+        command.extend(["-t", f"{target_duration:.6f}"])
+    command.extend([
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        output_audio_path,
+    ])
+    run_process_with_interrupt(
+        command,
+        f"Failed to mix audio tracks: {primary_audio_path} + {secondary_audio_path}",
+    )
+    if not os.path.exists(output_audio_path):
+        raise RuntimeError(f"LatentSync: mixed audio file missing: {output_audio_path}")
+    return output_audio_path
+
+
+def replace_video_audio_track(video_path, audio_path, output_video_path, duration=None):
+    duration_args = ["-t", f"{duration:.6f}"] if duration is not None else []
+    stream_copy_command = [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        video_path,
+        "-i",
+        audio_path,
+        *duration_args,
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        output_video_path,
+    ]
+    try:
+        run_process_with_interrupt(
+            stream_copy_command,
+            f"Failed to replace video audio track: {video_path}",
+        )
+    except RuntimeError as exc:
+        print(f"LatentSync: stream-copy remux failed, retrying with video re-encode ({exc})")
+
+        def build_command(codec):
+            return [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                *duration_args,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                *get_ffmpeg_video_encode_args(codec),
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                output_video_path,
+            ]
+
+        run_ffmpeg_video_command_with_fallback(
+            build_command,
+            f"Failed to replace video audio track: {video_path}",
+        )
+
+    if not os.path.exists(output_video_path):
+        raise RuntimeError(f"LatentSync: remuxed video file missing: {output_video_path}")
+    return output_video_path
 
 
 def trim_video_to_duration(video_path, target_video_path, target_duration):
@@ -1456,6 +1580,7 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
                 "mode": (["normal", "pingpong", "loop_to_audio"], {"default": PATH_NODE_DEFAULTS["mode"]}),
                 "silent_padding_sec": ("FLOAT", {"default": PATH_NODE_DEFAULTS["silent_padding_sec"], "min": 0.0, "max": 3.0, "step": 0.1}),
                 "auto_silent_padding": ("BOOLEAN", {"default": PATH_NODE_DEFAULTS["auto_silent_padding"]}),
+                "merge_source_audio": ("BOOLEAN", {"default": PATH_NODE_DEFAULTS["merge_source_audio"]}),
                 "filename_prefix": ("STRING", {"default": PATH_NODE_DEFAULTS["filename_prefix"]}),
             },
             "optional": {
@@ -1491,6 +1616,7 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
         mode=PATH_NODE_DEFAULTS["mode"],
         silent_padding_sec=PATH_NODE_DEFAULTS["silent_padding_sec"],
         auto_silent_padding=PATH_NODE_DEFAULTS["auto_silent_padding"],
+        merge_source_audio=PATH_NODE_DEFAULTS["merge_source_audio"],
         filename_prefix=PATH_NODE_DEFAULTS["filename_prefix"],
         audio=None,
         audio_path="",
@@ -1517,6 +1643,7 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
 
         try:
             audio_path_text = str(audio_path or "").strip()
+            has_external_audio_input = bool(audio_path_text) or audio is not None
             if audio_path_text:
                 resolved_audio_path = resolve_user_path(audio_path_text, "audio_path")
             elif audio is not None:
@@ -1564,6 +1691,41 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
 
             total_time = time.time() - start_time
             print(f"LatentSync path-node total processing time: {total_time:.2f}s")
+
+            if merge_source_audio and has_external_audio_input:
+                progress.update_fraction(0.96, stage="Preparing source audio")
+                if video_has_audio_stream(resolved_video_path):
+                    source_audio_extract_path = os.path.join(temp_dir, f"latentsync_{run_id}_source_audio.wav")
+                    aligned_source_audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_source_audio_aligned.wav")
+                    mixed_audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_mixed_audio.wav")
+                    remuxed_output_path = os.path.join(temp_dir, f"latentsync_{run_id}_remuxed.mp4")
+
+                    extract_audio_from_video(resolved_video_path, source_audio_extract_path)
+                    final_output_duration = probe_media_duration(final_output_path, "output video")
+                    adjust_audio_duration(
+                        source_audio_extract_path,
+                        aligned_source_audio_path,
+                        final_output_duration,
+                    )
+
+                    progress.update_fraction(0.975, stage="Mixing source audio")
+                    mix_audio_tracks(
+                        aligned_source_audio_path,
+                        aligned_audio_path,
+                        mixed_audio_path,
+                        target_duration=final_output_duration,
+                    )
+
+                    progress.update_fraction(0.985, stage="Remuxing mixed audio")
+                    replace_video_audio_track(
+                        final_output_path,
+                        mixed_audio_path,
+                        remuxed_output_path,
+                        duration=final_output_duration,
+                    )
+                    os.replace(remuxed_output_path, final_output_path)
+                else:
+                    print("LatentSync: merge_source_audio enabled but source video has no audio track, skipping mix")
 
             # Release GPU memory before building output
             self._maybe_cuda_empty_cache(execution_settings, force=True)

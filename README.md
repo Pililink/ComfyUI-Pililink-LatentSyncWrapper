@@ -114,6 +114,7 @@ latensync1.5/
 - `mode`：时长对齐模式，支持 `normal` / `pingpong` / `loop_to_audio`
 - `silent_padding_sec`：补齐音频时附加的静音秒数
 - `auto_silent_padding`：自动根据视频和音频时长差计算静音补齐时长
+- `merge_source_audio`：开启后，将源视频原音轨与传入的 `audio` / `audio_path` 混合到最终输出；默认关闭以保持旧行为
 - `filename_prefix`：输出到 ComfyUI `output` 目录时使用的前缀
 - `audio`：可选，ComfyUI 音频输入
 - `audio_path`：可选，本地音频绝对路径；填写后优先于 `audio`
@@ -122,6 +123,8 @@ latensync1.5/
 路径版节点会直接读取源视频路径并输出保存后的 mp4 路径和音频，不返回 `IMAGE` tensor，因此不受视频长度限制，适合长视频处理。默认会保留输出文件到 ComfyUI 的 `output` 目录。
 
 如果 `audio` 和 `audio_path` 都留空，节点会自动尝试提取输入视频自带音轨作为驱动音频。
+
+如果你同时传入了 `audio` / `audio_path`，又希望保留源视频里的环境声、背景音乐或现场声，可以把 `merge_source_audio` 打开。若源视频本身没有音轨，则会自动跳过混音，仍然只输出传入音频。
 
 时长模式说明：
 
