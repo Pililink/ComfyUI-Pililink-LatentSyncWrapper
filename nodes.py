@@ -1,5 +1,6 @@
 import atexit
 import importlib.util
+import errno
 import math
 import os
 import platform
@@ -939,6 +940,19 @@ def replace_video_audio_track(video_path, audio_path, output_video_path, duratio
     return output_video_path
 
 
+def replace_file_with_fallback(source_path, target_path):
+    try:
+        os.replace(source_path, target_path)
+        return target_path
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    shutil.copy2(source_path, target_path)
+    os.remove(source_path)
+    return target_path
+
+
 def trim_video_to_duration(video_path, target_video_path, target_duration):
     def build_command(codec):
         return [
@@ -1698,7 +1712,12 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
                     source_audio_extract_path = os.path.join(temp_dir, f"latentsync_{run_id}_source_audio.wav")
                     aligned_source_audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_source_audio_aligned.wav")
                     mixed_audio_path = os.path.join(temp_dir, f"latentsync_{run_id}_mixed_audio.wav")
-                    remuxed_output_path = os.path.join(temp_dir, f"latentsync_{run_id}_remuxed.mp4")
+                    output_dir = os.path.dirname(final_output_path) or "."
+                    output_stem, output_ext = os.path.splitext(os.path.basename(final_output_path))
+                    remuxed_output_path = os.path.join(
+                        output_dir,
+                        f".{output_stem}_{run_id}_remuxed{output_ext or '.mp4'}",
+                    )
 
                     extract_audio_from_video(resolved_video_path, source_audio_extract_path)
                     final_output_duration = probe_media_duration(final_output_path, "output video")
@@ -1723,7 +1742,7 @@ class LatentSyncVideoPathNode(LatentSyncNodeBase):
                         remuxed_output_path,
                         duration=final_output_duration,
                     )
-                    os.replace(remuxed_output_path, final_output_path)
+                    replace_file_with_fallback(remuxed_output_path, final_output_path)
                 else:
                     print("LatentSync: merge_source_audio enabled but source video has no audio track, skipping mix")
 
