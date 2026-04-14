@@ -1,3 +1,4 @@
+import gc
 import os
 import threading
 
@@ -26,6 +27,19 @@ except Exception:
 def throw_if_processing_interrupted():
     if comfy_model_management is not None:
         comfy_model_management.throw_exception_if_processing_interrupted()
+
+
+def _soft_empty_cache():
+    helper = getattr(comfy_model_management, "soft_empty_cache", None)
+    if callable(helper):
+        try:
+            helper()
+            return
+        except Exception:
+            pass
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _report_progress(progress_callback, stage, fraction):
@@ -238,8 +252,48 @@ class _RefactorRuntime:
         self.device_str = device_str
         self.dtype = dtype
         self.scheduler_type = str(scheduler_type or "ddim").strip().lower()
+        self.audio_encoder = audio_encoder
+        self.vae = vae
+        self.denoising_unet = denoising_unet
         self.pipeline = pipeline
         self.run_lock = threading.Lock()
+        self.loaded_device_str = device_str
+
+    def _move_pipeline_to_device(self, target_device_str, progress_callback=None):
+        target_device_str = str(target_device_str or "cpu")
+        if target_device_str == self.loaded_device_str:
+            return
+
+        throw_if_processing_interrupted()
+        if target_device_str == "cuda":
+            _report_progress(progress_callback, "Moving models to GPU", 0.11)
+        else:
+            _report_progress(progress_callback, "Releasing GPU memory", 0.98)
+
+        self.pipeline.to(target_device_str)
+        self.vae.to(device=target_device_str, dtype=self.dtype)
+        self.denoising_unet.to(device=target_device_str, dtype=self.dtype)
+        self.audio_encoder.model.to(target_device_str)
+        self.loaded_device_str = target_device_str
+
+    def _release_after_run(self):
+        image_processor = getattr(self.pipeline, "image_processor", None)
+        if image_processor is not None:
+            try:
+                image_processor.close()
+            except Exception:
+                pass
+            self.pipeline.image_processor = None
+
+        gc.collect()
+
+        if self.device_str == "cuda" and torch.cuda.is_available():
+            try:
+                self._move_pipeline_to_device("cpu")
+            except Exception as exc:
+                print(f"[LatentSync] Runtime offload warning: {exc}")
+            gc.collect()
+            _soft_empty_cache()
 
     def run(
         self,
@@ -266,6 +320,7 @@ class _RefactorRuntime:
         with self.run_lock:
             throw_if_processing_interrupted()
             _report_progress(progress_callback, "Preparing inference", 0.12)
+            self._move_pipeline_to_device(self.device_str, progress_callback=progress_callback)
 
             if seed != -1:
                 set_seed(seed)
@@ -384,6 +439,7 @@ class _RefactorRuntime:
                         torch.backends.cuda.matmul.allow_tf32 = previous_matmul_tf32
                     if previous_cudnn_tf32 is not None:
                         torch.backends.cudnn.allow_tf32 = previous_cudnn_tf32
+                self._release_after_run()
 
 
 def run_refactor_inference(
