@@ -284,15 +284,49 @@ atexit.register(module_cleanup)
 check_for_conflicts()
 
 comfy_model_management = None
+interrupt_processing_exception_type = None
 try:
     comfy_model_management = __import__("comfy.model_management", fromlist=["throw_exception_if_processing_interrupted"])
+    interrupt_processing_exception_type = getattr(
+        comfy_model_management,
+        "InterruptProcessingException",
+        None,
+    )
 except Exception:
     comfy_model_management = None
+    interrupt_processing_exception_type = None
 
 
 def throw_if_processing_interrupted():
     if comfy_model_management is not None:
         comfy_model_management.throw_exception_if_processing_interrupted()
+
+
+def is_processing_interrupt_exception(exc):
+    if interrupt_processing_exception_type is not None and isinstance(exc, interrupt_processing_exception_type):
+        return True
+    return exc.__class__.__name__ == "InterruptProcessingException"
+
+
+def run_callable_in_thread_with_interrupt(fn, poll_interval=0.1):
+    result_box = {}
+
+    def _runner():
+        try:
+            result_box["value"] = fn()
+        except BaseException as exc:
+            result_box["error"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+    while thread.is_alive():
+        throw_if_processing_interrupted()
+        thread.join(timeout=max(float(poll_interval or 0.1), 0.01))
+
+    if "error" in result_box:
+        raise result_box["error"]
+    return result_box.get("value")
 
 
 def get_latentsync_path(*parts, mkdir_parent=False):
@@ -334,6 +368,7 @@ def check_ffmpeg():
         return False
 
 def check_and_install_dependencies():
+    throw_if_processing_interrupted()
     if not check_ffmpeg():
         raise RuntimeError("FFmpeg is required but not found")
     
@@ -353,22 +388,25 @@ def check_and_install_dependencies():
     def install_package(package):
         python_exe = sys.executable
         try:
-            subprocess.check_call([python_exe, '-m', 'pip', 'install', package],
-                                    stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE)
+            run_process_with_interrupt(
+                [python_exe, "-m", "pip", "install", package],
+                f"Failed to install required package: {package}",
+            )
             print(f"Successfully installed {package}")
-        except subprocess.CalledProcessError as e:
+        except Exception as e:
             print(f"Error installing {package}: {str(e)}")
             raise RuntimeError(f"Failed to install required package: {package}")
             
     missing_packages = []
     for package in REQUIRED_PACKAGES:
+        throw_if_processing_interrupted()
         if not is_package_installed(package):
             missing_packages.append(package)
     
     if missing_packages:
         print(f"Installing missing packages: {', '.join(missing_packages)}")
         for package in missing_packages:
+            throw_if_processing_interrupted()
             try:
                 install_package(package)
             except Exception as e:
@@ -403,6 +441,7 @@ def is_probably_25fps_video(video_path):
 
 def download_model(url, save_path):
     """Download a model from a URL and save it to the specified path."""
+    throw_if_processing_interrupted()
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     # Check if file already exists
     if os.path.exists(save_path):
@@ -410,12 +449,13 @@ def download_model(url, save_path):
         return
         
     print(f"Downloading {url} to {save_path}...")
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=30)
     total_size = int(response.headers.get('content-length', 0))
     downloaded = 0
     
     with open(save_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8192):
+            throw_if_processing_interrupted()
             f.write(chunk)
             downloaded += len(chunk)
             if total_size > 0:
@@ -425,6 +465,7 @@ def download_model(url, save_path):
 
 def pre_download_models():
     """Pre-download all required models."""
+    throw_if_processing_interrupted()
     models = {
         "s3fd-e19a316812.pth": "https://www.adrianbulat.com/downloads/python-fan/s3fd-e19a316812.pth",
         # Add other models here
@@ -440,6 +481,7 @@ def pre_download_models():
         return
     
     for model_name, url in models.items():
+        throw_if_processing_interrupted()
         save_path = os.path.join(cache_dir, model_name)
         if not os.path.exists(save_path):
             print(f"Downloading {model_name}...")
@@ -483,14 +525,20 @@ def setup_models():
         throw_if_processing_interrupted()
         if snapshot_download is None:
             raise RuntimeError("huggingface_hub is not available")
-        snapshot_download(repo_id="ByteDance/LatentSync-1.5",
-                         allow_patterns=["latentsync_unet.pt", "whisper/tiny.pt"],
-                         local_dir=ckpt_dir, 
-                         local_dir_use_symlinks=False,
-                         cache_dir=temp_downloads)
+        run_callable_in_thread_with_interrupt(
+            lambda: snapshot_download(
+                repo_id="ByteDance/LatentSync-1.5",
+                allow_patterns=["latentsync_unet.pt", "whisper/tiny.pt"],
+                local_dir=ckpt_dir,
+                local_dir_use_symlinks=False,
+                cache_dir=temp_downloads,
+            )
+        )
         throw_if_processing_interrupted()
         print("LatentSync model checkpoints downloaded successfully!")
     except Exception as e:
+        if is_processing_interrupt_exception(e):
+            raise
         print(f"Error downloading LatentSync models: {str(e)}")
         print("\nPlease download models manually for LatentSync:")
         print("1. Visit: https://huggingface.co/chunyu-li/LatentSync")
